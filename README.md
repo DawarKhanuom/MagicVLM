@@ -1,4 +1,4 @@
-# MagicLeap-MeshScanningwithGUI
+# MagicLeap-VLM with meshing 
 
 
   Magic Leap Meshing Sample - Extended Version
@@ -13,7 +13,7 @@ This repository contains an extended version of the Magic Leap Meshing sample, o
   - Save the scanned mesh in `.obj` format.
   - Save the point cloud data in `.ply` format. {not working now} 
 - **Screenshot Functionality**: {tba} 
-- **Mesh LOD Switching**: Using the controller’s bumper button, you can toggle between different Levels of Detail (LOD) for the mesh rendering.
+- **Mesh LOD Switching**: Using the controllerâ€™s bumper button, you can toggle between different Levels of Detail (LOD) for the mesh rendering.
 
 ### Acknowledgments:
 This extended version builds upon Magic Leap's meshing sample, utilizing the core components provided in `meshing_material.h`:
