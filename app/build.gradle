@@ -1,5 +1,11 @@
 apply plugin: 'com.android.application'
 
+// When changing the two items below makes
+// sure to update the AndroidManifest.xml
+// and res/values/strings.xml to match.
+def application_name = "camera_mixed_reality";
+def application_id = "com.magicleap.capi.sample." + application_name;
+
 def keystoreProperties = new Properties()
 def storeFilePrefix = ""
 if (project.hasProperty('root_path')) {
@@ -22,7 +28,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.magicleap.capi.sample.meshing"
+        applicationId = application_id
         minSdkVersion 29
         targetSdk 33
         externalNativeBuild {
@@ -73,6 +79,7 @@ android {
             }
         }
     }
+    namespace application_id
 }
 
 gradle.projectsEvaluated {

@@ -13,7 +13,11 @@
 
 cmake_minimum_required(VERSION 3.22.1)
 
-project(meshing)
+project(camera_mixed_reality)
+
+
+# Set the ONNX Runtime prebuilt shared library path
+set(ORT_LIB "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libonnxruntime.so")
 
 file(TO_CMAKE_PATH "$ENV{MLSDK}" MLSDK)
 list(APPEND CMAKE_MODULE_PATH "${MLSDK}/cmake" "${ANDROID_NDK}/../../mlsdk/cmake")
@@ -21,15 +25,49 @@ list(APPEND CMAKE_MODULE_PATH "${MLSDK}/cmake" "${ANDROID_NDK}/../../mlsdk/cmake
 find_package(MagicLeap REQUIRED)
 find_package(MagicLeapAppFramework REQUIRED)
 
-add_library(meshing SHARED main.cpp)
-
-include(DeprecatedApiUsage)
-use_deprecated_api(meshing)
-
-target_link_libraries(meshing
-    ML::app_framework
+# Import the ONNX Runtime shared library
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES
+        IMPORTED_LOCATION "${ORT_LIB}"
+        # Point to the parent of 'onnxruntime/' folder in include
+        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/onnxruntime/include"
 )
 
+add_library(camera_mixed_reality SHARED main.cpp)
+
+include(DeprecatedApiUsage)
+target_include_directories(camera_mixed_reality PRIVATE
+        "${CMAKE_SOURCE_DIR}/onnxruntime/include"  # ONNX Runtime headers
+)
+
+use_deprecated_api(camera_mixed_reality)
+
+target_link_libraries(camera_mixed_reality
+        ML::app_framework
+        ML::camera
+        ML::media_format
+        ML::media_recorder
+        ML::media_error
+        onnxruntime    # ONNX Runtime shared library
+        dl             # For dlopen, dlsym
+)
+
+# Optional: set standard C++ version and flags
+set_target_properties(camera_mixed_reality PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+)
 if (COMMAND copy_artifacts)
-    copy_artifacts(meshing)
+    copy_artifacts(camera_mixed_reality)
 endif()
+
+
+
+
+
+
+
+
+
+
+
