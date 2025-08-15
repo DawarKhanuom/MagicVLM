@@ -1,0 +1,52 @@
+# Ignore all dot folders except .git
+.*/
+!.git/
+
+# Gradle
+.gradle/
+build/
+*/build/
+
+# Local configuration
+local.properties
+.gradle/
+.idea/
+*.iml
+
+# Android Studio / IntelliJ
+.idea/
+*.iws
+*.ipr
+*.iml
+out/
+
+# Generated files
+gen/
+bin/
+obj/
+
+# Android specific
+captures/
+output.json
+*.apk
+*.ap_
+*.dex
+*.class
+*.jar
+*.war
+*.ear
+*.db
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Models
+models/
+
+# Magic Leap specific
+mlsdk/
+app/.cxx/
