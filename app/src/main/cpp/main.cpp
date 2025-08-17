@@ -50,6 +50,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <regex>
 
 
 #include "onnxruntime/core/session/onnxruntime_c_api.h"
@@ -59,6 +60,10 @@
 #define EGL_EGLEXT_PROTOTYPES
 #include <EGL/eglext.h>
 #endif
+
+// --- stb_image (one-time implementation) ---
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>      // or: #include <stb/stb_image.h>
 
 #define UNWRAP_RET_MEDIARESULT(res) UNWRAP_RET_MLRESULT_GENERIC(res, UNWRAP_MLMEDIA_RESULT);
 
@@ -416,226 +421,563 @@ CameraMixedRealityApp::~CameraMixedRealityApp() {
         }
     }
 }
-//void CameraMixedRealityApp::InitializeONNX() {
-//    ort_ = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-//    if (!ort_) {
-//        ALOGE("ONNX: Failed to get ORT API");
-//        onnx_status_message_ = "ONNX init failed: API not available.";
-//        return;
-//    }
-//
-//    const char* ort_version = OrtGetApiBase()->GetVersionString();
-//    ALOGI("ONNX Runtime Version: %s", ort_version ? ort_version : "unknown");
-//    onnx_status_message_ = "ONNX Runtime Version: " + std::string(ort_version ? ort_version : "unknown");
-//
-//    OrtEnv* env = nullptr;
-//    OrtStatus* status = ort_->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ML2App", &env);
-//    if (status) {
-//        onnx_status_message_ += "\nFailed to create ONNX environment.";
-//        ort_->ReleaseStatus(status);
-//        return;
-//    }
-//
-//    OrtSessionOptions* session_options;
-//    ort_->CreateSessionOptions(&session_options);
-//    ort_->SetIntraOpNumThreads(session_options, 1);
-//
-//    // Load encoder model
-//    std::string encoder_path = "/storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/encoder_model.onnx";
-//    status = ort_->CreateSession(env, encoder_path.c_str(), session_options, &encoder_session_);
-//    if (status) {
-//        onnx_status_message_ += "\nFailed to load encoder.";
-//        ort_->ReleaseStatus(status);
-//    } else {
-//        onnx_status_message_ += "\nEncoder loaded.";
-//    }
-//
-//    // Load decoder model
-//    std::string decoder_path = "/storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/decoder_model.onnx";
-//    status = ort_->CreateSession(env, decoder_path.c_str(), session_options, &decoder_session_);
-//    if (status) {
-//        onnx_status_message_ += "\nFailed to load decoder.";
-//        ort_->ReleaseStatus(status);
-//    } else {
-//        onnx_status_message_ += "\nDecoder loaded.";
-//    }
-//
-//    ort_->ReleaseSessionOptions(session_options);
-//    ort_->ReleaseEnv(env);
-//
-//    // Dummy inference test
-//    if (decoder_session_) {
-//        std::vector<int64_t> input_ids = {101, 7592, 102};  // e.g., [CLS] hello [SEP]
-//        std::vector<int64_t> shape = {1, static_cast<int64_t>(input_ids.size())};
-//
-//        OrtMemoryInfo* mem_info;
-//        ort_->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
-//
-//        OrtValue* input_tensor = nullptr;
-//        ort_->CreateTensorWithDataAsOrtValue(mem_info, input_ids.data(),
-//                                             input_ids.size() * sizeof(int64_t), shape.data(), shape.size(),
-//                                             ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &input_tensor);
-//
-//        const char* input_names[] = {"input"};
-//        const char* output_names[] = {"output"};
-//        OrtValue* output_tensor = nullptr;
-//
-//        status = ort_->Run(decoder_session_, nullptr, input_names, &input_tensor, 1,
-//                           output_names, 1, &output_tensor);
-//
-//        if (!status) {
-//            // Placeholder response (real decoding requires tokenizer/vocab)
-//            onnx_status_message_ += "\nVLM response: [Hello captioned]";
-//            ort_->ReleaseValue(output_tensor);
-//        } else {
-//            onnx_status_message_ += "\nInference failed.";
-//            ort_->ReleaseStatus(status);
-//        }
-//
-//        ort_->ReleaseValue(input_tensor);
-//        ort_->ReleaseMemoryInfo(mem_info);
-//    }
-//
-//    onnx_initialized_ = true;
-//}
+
+
+
+
+
+#include <regex>
+
+// Read the whole file into a std::string
+static bool ReadFileToString(const std::string& path, std::string& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return false; }
+    fseek(f, 0, SEEK_SET);
+    out.resize((size_t)sz);
+    if (sz > 0) fread(&out[0], 1, (size_t)sz, f);
+    fclose(f);
+    return true;
+}
+
+// Build id->token list from vocab.json (string->int JSON map). Very lightweight parser.
+static bool LoadGpt2VocabIdToToken(const std::string& vocab_path, std::vector<std::string>& id_to_token) {
+    std::string json;
+    if (!ReadFileToString(vocab_path, json)) return false;
+
+    // Regex over entries:  "token": number
+    // This is a simple approach; GPT-2 vocab keys are safe (no nested quotes).
+    std::regex entry(R"xxx("([^"\\]|\\.)*"\s*:\s*\d+)xxx"); // find entries first
+    std::regex pair (R"xxx("((?:[^"\\]|\\.)*)"\s*:\s*(\d+))xxx");
+
+    size_t max_id = 0;
+    std::vector<std::pair<size_t,std::string>> items;
+
+    auto it = std::sregex_iterator(json.begin(), json.end(), entry);
+    auto end = std::sregex_iterator();
+    for (; it != end; ++it) {
+        std::smatch m;
+        std::string e = it->str();
+        if (std::regex_search(e, m, pair)) {
+            std::string tok = m[1].str();
+            size_t id = (size_t)strtoull(m[2].str().c_str(), nullptr, 10);
+            // Unescape minimal \" and \\ (good enough for GPT-2 vocab)
+            std::string clean; clean.reserve(tok.size());
+            for (size_t i=0;i<tok.size();++i) {
+                if (tok[i]=='\\' && i+1<tok.size()) {
+                    char c = tok[i+1];
+                    if (c=='"' || c=='\\' || c=='/') { clean.push_back(c); ++i; }
+                    else if (c=='n') { clean.push_back('\n'); ++i; }
+                    else if (c=='t') { clean.push_back('\t'); ++i; }
+                    else { clean.push_back(tok[i]); }
+                } else {
+                    clean.push_back(tok[i]);
+                }
+            }
+            items.emplace_back(id, clean);
+            if (id > max_id) max_id = id;
+        }
+    }
+
+    if (items.empty()) return false;
+    id_to_token.assign(max_id+1, std::string());
+    for (auto& kv : items) {
+        if (kv.first < id_to_token.size()) id_to_token[kv.first] = kv.second;
+    }
+    return true;
+}
+
+// Very simple GPT-2-ish “pretty” decode: join tokens and clean common markers.
+// (Not a full byte-level decoder, but good enough to read in GUI.)
+static std::string SimpleDecodeGpt2(const std::vector<int64_t>& ids,
+                                    const std::vector<std::string>& id_to_token) {
+    std::string s;
+    s.reserve(ids.size()*3);
+    for (auto id : ids) {
+        if (id >= 0 && (size_t)id < id_to_token.size()) {
+            const std::string& t = id_to_token[(size_t)id];
+            if (t == "<|endoftext|>" || t == "" || t == " ") continue;
+            s += t;
+        } else {
+            // unknown id → just skip or add placeholder
+        }
+    }
+    // Clean common byte-level artifacts for readability
+    auto replace_all = [&](const std::string& from, const std::string& to) {
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+    replace_all("Ġ", " ");   // space marker
+    replace_all("Ċ", "\n");  // newline marker
+    return s;
+}
+
+// UTF-8 safe substring replace
+static void ReplaceAll(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+
+
+
 void CameraMixedRealityApp::InitializeONNX() {
-    // Reset UI state
+    // ----------- Guard re-entry (button double-hit etc.) -----------
+    static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    if (busy.test_and_set()) {
+        onnx_status_message_ = "ONNX is already running…";
+        return;
+    }
+    auto clear_busy = [&]() { busy.clear(); };
+
     onnx_status_message_.clear();
     onnx_initialized_ = false;
 
-    // ORT API
-    ort_ = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!ort_) {
-        onnx_status_message_ = "ONNX init failed: API not available.";
-        ALOGE("%s", onnx_status_message_.c_str());
-        return;
-    }
+    // ----------- Small helpers (local lambdas) -----------
+    auto FileExists = [](const std::string& p)->bool {
+        FILE* f = fopen(p.c_str(), "rb");
+        if (!f) return false; fclose(f); return true;
+    };
 
-    // ORT env
-    OrtEnv* env = nullptr;
-    OrtStatus* st = ort_->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ML2App", &env);
-    if (st) {
-        const char* msg = ort_->GetErrorMessage(st);
-        onnx_status_message_ = std::string("ONNX env failed: ") + (msg ? msg : "unknown");
-        ALOGE("%s", onnx_status_message_.c_str());
-        ort_->ReleaseStatus(st);
-        return;
-    }
+    auto LoadImageCHW224F32 = [&](const std::string& path,
+                                  std::vector<float>& out, int& W, int& H)->bool {
+        // Uses stb_image to load and CPU-resize to 224x224 (nearest), then normalize.
+        int w=0,h=0,c=0;
+        unsigned char* img = stbi_load(path.c_str(), &w, &h, &c, 3); // force 3ch
+        if (!img) return false;
+        const int outW = 224, outH = 224, ch = 3;
+        out.resize(ch * outH * outW);
 
-    // Session options
-    OrtSessionOptions* so = nullptr;
-    st = ort_->CreateSessionOptions(&so);
-    if (st) { ALOGE("CreateSessionOptions failed"); ort_->ReleaseStatus(st); ort_->ReleaseEnv(env); return; }
-    ort_->SetIntraOpNumThreads(so, 1);
+        auto samp = [&](float x, float y, int chn) -> float {
+            // nearest
+            int ix = (int)std::roundf(x), iy=(int)std::roundf(y);
+            if (ix < 0) ix = 0; if (ix >= w) ix = w-1;
+            if (iy < 0) iy = 0; if (iy >= h) iy = h-1;
+            int idx = (iy*w + ix)*3 + chn;
+            return (float)img[idx] / 255.0f;
+        };
 
-    // Load encoder
-    std::string encoder_path = "/storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/encoder_model.onnx";
-    st = ort_->CreateSession(env, encoder_path.c_str(), so, &encoder_session_);
-    if (st) {
-        const char* msg = ort_->GetErrorMessage(st);
-        onnx_status_message_ += std::string("\nEncoder load failed: ") + (msg ? msg : "unknown");
-        ALOGE("Encoder load failed: %s", msg ? msg : "unknown");
-        ort_->ReleaseStatus(st);
-    } else {
-        onnx_status_message_ += "\nEncoder loaded successfully";
-    }
-
-    // Load decoder
-    std::string decoder_path = "/storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/decoder_model.onnx";
-    st = ort_->CreateSession(env, decoder_path.c_str(), so, &decoder_session_);
-    if (st) {
-        const char* msg = ort_->GetErrorMessage(st);
-        onnx_status_message_ += std::string("\nDecoder load failed: ") + (msg ? msg : "unknown");
-        ALOGE("Decoder load failed: %s", msg ? msg : "unknown");
-        ort_->ReleaseStatus(st);
-    } else {
-        onnx_status_message_ += "\nDecoder loaded successfully";
-    }
-
-    // --- Simple decoder test (use your real inputs later) ---
-    if (decoder_session_) {
-        // One caption string declared ONCE; reuse below – no redefinition.
-        std::string caption;
-
-        // Example input_ids tensor: BOS token for GPT2-ish (adjust to your vocab)
-        std::vector<int64_t> input_ids = {50256};
-        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(input_ids.size())};
-
-        OrtMemoryInfo* mi = nullptr;
-        st = ort_->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mi);
-        if (!st) {
-            OrtValue* in = nullptr;
-            st = ort_->CreateTensorWithDataAsOrtValue(
-                    mi,
-                    input_ids.data(),
-                    input_ids.size() * sizeof(int64_t),
-                    input_shape.data(),
-                    input_shape.size(),
-                    ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
-                    &in
-            );
-
-            if (!st) {
-                const char* in_names[]  = {"input_ids"};  // make sure these match your model
-                const char* out_names[] = {"logits"};
-                OrtValue* out = nullptr;
-
-                st = ort_->Run(decoder_session_, nullptr,
-                               in_names,  &in,  1,
-                               out_names, 1,    &out);
-
-                if (!st) {
-                    // Inspect output shape quickly (optional)
-                    OrtTensorTypeAndShapeInfo* ti = nullptr;
-                    ort_->GetTensorTypeAndShape(out, &ti);
-                    size_t nd = 0;
-                    ort_->GetDimensionsCount(ti, &nd);
-                    std::vector<int64_t> dims(nd, 0);
-                    ort_->GetDimensions(ti, dims.data(), nd);
-                    ort_->ReleaseTensorTypeAndShapeInfo(ti);
-
-                    // You can grab logits if needed:
-                    // float* logits = nullptr;
-                    // ort_->GetTensorMutableData(out, (void**)&logits);
-
-                    caption = "[Decoder ran OK (dummy test)]";
-                    onnx_status_message_ += "\nDecoder test successful";
-                    ort_->ReleaseValue(out);
-                } else {
-                    const char* msg = ort_->GetErrorMessage(st);
-                    onnx_status_message_ += std::string("\nDecoder test failed: ") + (msg ? msg : "unknown");
-                    ALOGE("Decoder test failed: %s", msg ? msg : "unknown");
-                    ort_->ReleaseStatus(st);
-                }
-
-                ort_->ReleaseValue(in);
-            } else {
-                const char* msg = ort_->GetErrorMessage(st);
-                onnx_status_message_ += std::string("\nCreateTensor failed: ") + (msg ? msg : "unknown");
-                ALOGE("CreateTensor failed: %s", msg ? msg : "unknown");
-                ort_->ReleaseStatus(st);
+        for (int oy=0; oy<outH; ++oy) {
+            for (int ox=0; ox<outW; ++ox) {
+                float sx = ( (ox + 0.5f) * w / (float)outW ) - 0.5f;
+                float sy = ( (oy + 0.5f) * h / (float)outH ) - 0.5f;
+                float r = samp(sx,sy,0);
+                float g = samp(sx,sy,1);
+                float b = samp(sx,sy,2);
+                // normalize to [-1,1] via (x-0.5)/0.5
+                r = (r - 0.5f) / 0.5f;
+                g = (g - 0.5f) / 0.5f;
+                b = (b - 0.5f) / 0.5f;
+                // CHW layout
+                int idx = oy*outW + ox;
+                out[0*outH*outW + idx] = r;
+                out[1*outH*outW + idx] = g;
+                out[2*outH*outW + idx] = b;
             }
-
-            ort_->ReleaseMemoryInfo(mi);
-        } else {
-            const char* msg = ort_->GetErrorMessage(st);
-            onnx_status_message_ += std::string("\nCreateCpuMemoryInfo failed: ") + (msg ? msg : "unknown");
-            ALOGE("CreateCpuMemoryInfo failed: %s", msg ? msg : "unknown");
-            ort_->ReleaseStatus(st);
         }
+        stbi_image_free(img);
+        W = outW; H = outH;
+        return true;
+    };
 
-        if (!caption.empty()) {
-            onnx_status_message_ += std::string("\nVLM response: ") + caption;
+    // Super-simple vocab loader (vocab.json: {"token": id, ...}) → id->token
+    auto LoadVocabIdToToken = [&](const std::string& path, std::vector<std::string>& id2tok)->bool {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { fclose(f); return false; }
+        std::string s; s.resize((size_t)sz);
+        fread(&s[0], 1, (size_t)sz, f); fclose(f);
+
+        size_t i=0, n=s.size();
+        auto skip_ws=[&]{while(i<n && (unsigned char)s[i]<=32) ++i;};
+        auto parse_string=[&]()->std::string{
+            std::string out; if (i>=n || s[i]!='"') return out; ++i;
+            while (i<n) {
+                char c = s[i++];
+                if (c=='\\' && i<n) {
+                    char e = s[i++];
+                    if (e=='"'||e=='\\'||e=='/') out.push_back(e);
+                    else if (e=='b') out.push_back('\b');
+                    else if (e=='f') out.push_back('\f');
+                    else if (e=='n') out.push_back('\n');
+                    else if (e=='r') out.push_back('\r');
+                    else if (e=='t') out.push_back('\t');
+                    else out.push_back(e); // very naive for \uXXXX
+                } else if (c=='"') break;
+                else out.push_back(c);
+            }
+            return out;
+        };
+        auto parse_int=[&]()->long{
+            skip_ws(); bool neg=false; if (i<n && (s[i]=='-'||s[i]=='+')) { neg=(s[i]=='-'); ++i; }
+            long v=0; while(i<n && s[i]>='0' && s[i]<='9'){ v = v*10 + (s[i]-'0'); ++i; }
+            return neg? -v : v;
+        };
+
+        id2tok.clear(); id2tok.reserve(50000);
+        // crude scan: "token" : number,
+        while (i<n) {
+            // find next key
+            while (i<n && s[i]!='"') ++i;
+            if (i>=n) break;
+            std::string key = parse_string();
+            if (key.empty()) break;
+            // move to ':'
+            while (i<n && s[i] != ':') ++i;
+            if (i<n) ++i;
+            long id = parse_int();
+            if (id >= 0) {
+                if ((size_t)id >= id2tok.size()) id2tok.resize((size_t)id+1);
+                id2tok[(size_t)id] = key;
+            }
+            // move forward to next pair
+            while (i<n && s[i]!=',' && s[i]!='}') ++i;
+            if (i<n && s[i]==',') ++i;
+            if (i<n && s[i]=='}') { ++i; break; }
+        }
+        return !id2tok.empty();
+    };
+
+    // Best-effort decode: join GPT-2 tokens with simple fixes
+    auto SimpleDecode = [&](const std::vector<int64_t>& ids,
+                            const std::vector<std::string>& id2tok)->std::string {
+        std::string out;
+        for (auto id : ids) {
+            if (id < 0 || (size_t)id >= id2tok.size()) continue;
+            const std::string& t = id2tok[(size_t)id];
+            if (t.empty()) continue;
+            // crude cleanups common with GPT-2/byte BPE vocab
+            if (t == "Ċ") { out.push_back('\n'); continue; }
+            if (!out.empty() && (t=="," || t=="." || t=="!" || t=="?" || t==";" || t==":" )) {
+                // attach punctuation without space
+                out += t; continue;
+            }
+            // common spacer marker in some BPEs (not strictly GPT-2)
+            std::string cleaned = t;
+
+            ReplaceAll(cleaned, u8"Ġ", " ");   // GPT-2 "space" marker
+// optional extras:
+            ReplaceAll(cleaned, u8"Ċ", "\n");  // GPT-2 "newline" marker
+            ReplaceAll(cleaned, "<|endoftext|>", "");
+
+
+            // heuristic: add space if needed
+            if (!out.empty() && out.back()!=' ' && cleaned.size() && cleaned[0] != '\n' && cleaned[0] != ' ')
+                out.push_back(' ');
+            out += cleaned;
+        }
+        // trim
+        while(!out.empty() && (out.front()==' ' || out.front()=='\n')) out.erase(out.begin());
+        return out;
+    };
+
+    // ----------- 1) ORT API / Env / SessionOptions -----------
+    ort_ = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!ort_) { onnx_status_message_ = "ONNX: API not available"; clear_busy(); return; }
+
+    OrtEnv* env = nullptr;
+    if (OrtStatus* st = ort_->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ML2App_Caption", &env)) {
+        onnx_status_message_ = std::string("CreateEnv failed: ") + (ort_->GetErrorMessage(st) ? ort_->GetErrorMessage(st) : "unknown");
+        ort_->ReleaseStatus(st); clear_busy(); return;
+    }
+
+    OrtSessionOptions* so = nullptr;
+    if (OrtStatus* st = ort_->CreateSessionOptions(&so)) {
+        onnx_status_message_ = std::string("CreateSessionOptions failed: ") + (ort_->GetErrorMessage(st) ? ort_->GetErrorMessage(st) : "unknown");
+        ort_->ReleaseStatus(st); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+    ort_->SetIntraOpNumThreads(so, 1);
+    ort_->SetInterOpNumThreads(so, 1);
+    ort_->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_BASIC);
+
+    // ----------- 2) Load models -----------
+    const std::string base = "/storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/";
+    const std::string enc_path = base + "encoder_model.onnx";
+    const std::string dec_path = base + "decoder_model.onnx";
+    const std::string img_path = base + "dk.jpg";
+
+    // clean old sessions
+    if (encoder_session_) { ort_->ReleaseSession(encoder_session_); encoder_session_ = nullptr; }
+    if (decoder_session_) { ort_->ReleaseSession(decoder_session_); decoder_session_ = nullptr; }
+
+    OrtStatus* stA = ort_->CreateSession(env, enc_path.c_str(), so, &encoder_session_);
+    OrtStatus* stB = ort_->CreateSession(env, dec_path.c_str(), so, &decoder_session_);
+    if (stA) { onnx_status_message_ += "Encoder load failed.\n"; ort_->ReleaseStatus(stA); }
+    else     { onnx_status_message_ += "Encoder loaded.\n"; }
+    if (stB) { onnx_status_message_ += "Decoder load failed.\n"; ort_->ReleaseStatus(stB); }
+    else     { onnx_status_message_ += "Decoder loaded.\n"; }
+
+    if (!encoder_session_ || !decoder_session_) {
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+
+    // ----------- 3) Resolve names -----------
+    OrtAllocator* alloc = nullptr; ort_->GetAllocatorWithDefaultOptions(&alloc);
+    auto get_names = [&](OrtSession* s, bool input, std::vector<char*>& names) {
+        size_t n=0; (input ? ort_->SessionGetInputCount(s,&n) : ort_->SessionGetOutputCount(s,&n));
+        names.resize(n,nullptr);
+        for (size_t i=0;i<n;++i) {
+            char* nm=nullptr;
+            (input ? ort_->SessionGetInputName(s,i,alloc,&nm) : ort_->SessionGetOutputName(s,i,alloc,&nm));
+            names[i] = nm;
+        }
+    };
+    std::vector<char*> enc_in_names, enc_out_names, dec_in_names, dec_out_names;
+    get_names(encoder_session_, true,  enc_in_names);
+    get_names(encoder_session_, false, enc_out_names);
+    get_names(decoder_session_, true,  dec_in_names);
+    get_names(decoder_session_, false, dec_out_names);
+
+    const char* enc_in  = enc_in_names.empty()?  "pixel_values" : enc_in_names[0];
+    const char* enc_out = enc_out_names.empty()? nullptr         : enc_out_names[0];
+    if (!enc_out) { onnx_status_message_ += "No encoder output name.\n"; }
+
+    const char* dec_in_ids = nullptr;
+    const char* dec_in_hs  = nullptr;
+    for (auto* n: dec_in_names) if (n) {
+            std::string s(n);
+            if (!dec_in_ids && s.find("input_ids") != std::string::npos) dec_in_ids = n;
+            if (!dec_in_hs  && (s.find("encoder_hidden_states")!=std::string::npos ||
+                                s.find("encoder_outputs")!=std::string::npos ||
+                                s.find("encoder_out")!=std::string::npos)) dec_in_hs = n;
+        }
+    const char* dec_out_logits = dec_out_names.empty()? "logits" : dec_out_names[0];
+
+    if (!enc_out || !dec_in_ids || !dec_in_hs) {
+        onnx_status_message_ += "Abort: required I/O names not found.\n";
+        if (alloc){ for (auto*p:enc_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:enc_out_names)if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_out_names)if(p) alloc->Free(alloc,p); }
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+
+    // ----------- 4) Load & preprocess image dk.jpg -----------
+    if (!FileExists(img_path)) {
+        onnx_status_message_ += "Image dk.jpg not found in models folder.\n";
+        if (alloc){ for (auto*p:enc_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:enc_out_names)if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_out_names)if(p) alloc->Free(alloc,p); }
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+    std::vector<float> pix; int W=0,H=0;
+    if (!LoadImageCHW224F32(img_path, pix, W, H)) {
+        onnx_status_message_ += "Failed to load/resize image.\n";
+        if (alloc){ for (auto*p:enc_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:enc_out_names)if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_out_names)if(p) alloc->Free(alloc,p); }
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+
+    // ----------- 5) Run encoder -----------
+    OrtMemoryInfo* mi = nullptr; ort_->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mi);
+    int64_t enc_shape[4] = {1,3, (int64_t)H, (int64_t)W};
+    OrtValue* enc_input = nullptr;
+    OrtStatus* stC = ort_->CreateTensorWithDataAsOrtValue(
+            mi, pix.data(), pix.size()*sizeof(float),
+            enc_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &enc_input);
+    if (stC) {
+        onnx_status_message_ += "CreateTensor(enc_input) failed.\n";
+        ort_->ReleaseStatus(stC);
+    }
+
+    OrtValue* enc_output = nullptr;
+    if (enc_input) {
+        const char* in_names[]  = { enc_in };
+        const char* out_names[] = { enc_out };
+        if (OrtStatus* st = ort_->Run(encoder_session_, nullptr, in_names, &enc_input, 1, out_names, 1, &enc_output)) {
+            onnx_status_message_ += "Encoder run failed.\n";
+            ort_->ReleaseStatus(st);
+        } else {
+            onnx_status_message_ += "Encoder run OK.\n";
         }
     }
 
-    // Cleanup session options/env
+    // read encoder output dims and data
+    std::vector<int64_t> enc_out_dims;
+    std::vector<float>   enc_feat;
+    if (enc_output) {
+        OrtTensorTypeAndShapeInfo* ti = nullptr; ort_->GetTensorTypeAndShape(enc_output, &ti);
+        size_t nd=0; if (ti) ort_->GetDimensionsCount(ti,&nd);
+        enc_out_dims.resize(nd,0);
+        if (ti && nd) ort_->GetDimensions(ti, enc_out_dims.data(), nd);
+        float* ptr=nullptr; ort_->GetTensorMutableData(enc_output,(void**)&ptr);
+        size_t cnt=1; for (auto d: enc_out_dims) { if (d<1) d=1; cnt *= (size_t)d; }
+        if (ptr && cnt) enc_feat.assign(ptr, ptr+cnt);
+        if (ti) ort_->ReleaseTensorTypeAndShapeInfo(ti);
+    }
+    if (enc_input)  ort_->ReleaseValue(enc_input);
+    if (enc_output) ort_->ReleaseValue(enc_output);
+
+    if (enc_feat.empty()) {
+        onnx_status_message_ += "Encoder produced empty features.\n";
+        if (mi) ort_->ReleaseMemoryInfo(mi);
+        if (alloc){ for (auto*p:enc_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:enc_out_names)if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_out_names)if(p) alloc->Free(alloc,p); }
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+
+    // ----------- 6) Decoder greedy generation -----------
+    // Find element type for input_ids (INT64 vs INT32)
+    ONNXTensorElementDataType ids_elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+    {
+        OrtTypeInfo* ti=nullptr;
+        if (!ort_->SessionGetInputTypeInfo(decoder_session_, 0, &ti) && ti) {
+            const OrtTensorTypeAndShapeInfo* tti=nullptr;
+            if (!ort_->CastTypeInfoToTensorInfo(ti,&tti) && tti) {
+                ONNXTensorElementDataType e=ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+                ort_->GetTensorElementType(tti,&e);
+                if (e == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) ids_elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+            }
+            ort_->ReleaseTypeInfo(ti);
+        }
+    }
+
+    // BOS/EOS for GPT-2 style
+    const int64_t BOS = 50256, EOS = 50256;
+    std::vector<int64_t> input_ids; input_ids.push_back(BOS);
+    int64_t ids_shape[2] = {1, 1};
+    OrtValue* t_ids = nullptr;
+
+    auto rebuild_ids = [&]() -> bool {
+        if (t_ids) { ort_->ReleaseValue(t_ids); t_ids = nullptr; }
+        ids_shape[1] = (int64_t)input_ids.size();
+        if (ids_elem == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32) {
+            std::vector<int32_t> ids32(input_ids.begin(), input_ids.end());
+            if (OrtStatus* st = ort_->CreateTensorWithDataAsOrtValue(
+                    mi, ids32.data(), ids32.size()*sizeof(int32_t),
+                    ids_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &t_ids)) {
+                ort_->ReleaseStatus(st); return false;
+            }
+        } else {
+            if (OrtStatus* st = ort_->CreateTensorWithDataAsOrtValue(
+                    mi, input_ids.data(), input_ids.size()*sizeof(int64_t),
+                    ids_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &t_ids)) {
+                ort_->ReleaseStatus(st); return false;
+            }
+        }
+        return true;
+    };
+
+    if (!rebuild_ids()) {
+        onnx_status_message_ += "Failed to create input_ids tensor.\n";
+        if (mi) ort_->ReleaseMemoryInfo(mi);
+        if (alloc){ for (auto*p:enc_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:enc_out_names)if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_in_names) if(p) alloc->Free(alloc,p);
+            for (auto*p:dec_out_names)if(p) alloc->Free(alloc,p); }
+        ort_->ReleaseSessionOptions(so); ort_->ReleaseEnv(env); clear_busy(); return;
+    }
+
+    // encoder_hidden_states tensor from enc_feat
+    OrtValue* t_hs = nullptr;
+    if (OrtStatus* st = ort_->CreateTensorWithDataAsOrtValue(
+            mi, enc_feat.data(), enc_feat.size()*sizeof(float),
+            enc_out_dims.data(), enc_out_dims.size(),
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &t_hs)) {
+        onnx_status_message_ += "CreateTensor(encoder_hidden_states) failed.\n";
+        ort_->ReleaseStatus(st);
+    }
+
+    std::vector<int64_t> gen_ids; // newly generated (for display)
+    int max_steps = 30;
+    for (int step=0; step<max_steps; ++step) {
+        if (!t_ids || !t_hs) break;
+        const char* feed_names[2] = { dec_in_ids, dec_in_hs };
+        OrtValue*   feed_vals [2] = { t_ids,      t_hs      };
+        const char* fetch_names[1] = { dec_out_logits };
+        OrtValue*   fetches    [1] = { nullptr };
+
+        OrtStatus* st = ort_->Run(decoder_session_, nullptr,
+                                  feed_names, feed_vals, 2,
+                                  fetch_names, 1, fetches);
+        if (st) {
+            onnx_status_message_ += "Decoder run failed.\n";
+            ort_->ReleaseStatus(st);
+            if (fetches[0]) ort_->ReleaseValue(fetches[0]);
+            break;
+        }
+
+        // logits shape [1, seq_len, vocab]
+        float* logits = nullptr; ort_->GetTensorMutableData(fetches[0], (void**)&logits);
+        OrtTensorTypeAndShapeInfo* ti=nullptr; ort_->GetTensorTypeAndShape(fetches[0], &ti);
+        size_t nd=0; std::vector<int64_t> lshape;
+        if (ti) { ort_->GetDimensionsCount(ti,&nd); lshape.resize(nd,0); if (nd) ort_->GetDimensions(ti,lshape.data(),nd); }
+        int64_t seq_len = (lshape.size()>=2)? lshape[1] : 0;
+        int64_t vocab   = (lshape.size()>=3)? lshape[2] : 0;
+        int64_t best_id = 0;
+        if (logits && seq_len>0 && vocab>0) {
+            float* last = logits + (seq_len-1)*vocab;
+            float best_val = last[0];
+            for (int64_t i=1;i<vocab;++i) if (last[i] > best_val) { best_val = last[i]; best_id = i; }
+        }
+        if (ti) ort_->ReleaseTensorTypeAndShapeInfo(ti);
+        ort_->ReleaseValue(fetches[0]);
+
+        input_ids.push_back(best_id);
+        gen_ids.push_back(best_id);
+        if (best_id == EOS) break;
+        if (!rebuild_ids()) { onnx_status_message_ += "Rebuild input_ids failed.\n"; break; }
+    }
+
+    // ----------- 7) Display results -----------
+    onnx_status_message_ += "Caption token IDs: ";
+    for (size_t i=1; i<input_ids.size(); ++i) { // skip BOS at index 0
+        onnx_status_message_ += std::to_string(input_ids[i]);
+        if (i+1 < input_ids.size()) onnx_status_message_ += ",";
+    }
+    onnx_status_message_ += "\n";
+
+    // best-effort text decode using vocab.json if present
+    const std::string vocab_path = base + "vocab.json";
+    std::vector<std::string> id2tok;
+    if (FileExists(vocab_path) && LoadVocabIdToToken(vocab_path, id2tok)) {
+        std::string decoded = SimpleDecode(std::vector<int64_t>(input_ids.begin()+1, input_ids.end()), id2tok);
+        if (!decoded.empty()) {
+            onnx_status_message_ += "Caption (decoded): ";
+            onnx_status_message_ += decoded;
+            onnx_status_message_ += "\n";
+        } else {
+            onnx_status_message_ += "Decoded caption empty (vocab present).\n";
+        }
+    } else {
+        onnx_status_message_ += "vocab.json not found → showing IDs only.\n";
+    }
+
+    // ----------- Cleanup -----------
+    if (t_ids)  ort_->ReleaseValue(t_ids);
+    if (t_hs)   ort_->ReleaseValue(t_hs);
+    if (mi)     ort_->ReleaseMemoryInfo(mi);
+
+    if (alloc){
+        for (auto*p:enc_in_names)  if(p) alloc->Free(alloc,p);
+        for (auto*p:enc_out_names) if(p) alloc->Free(alloc,p);
+        for (auto*p:dec_in_names)  if(p) alloc->Free(alloc,p);
+        for (auto*p:dec_out_names) if(p) alloc->Free(alloc,p);
+    }
     ort_->ReleaseSessionOptions(so);
     ort_->ReleaseEnv(env);
 
     onnx_initialized_ = true;
-    onnx_status_message_ += "\nONNX initialization complete";
+    onnx_status_message_ += "ONNX captioning complete.\n";
+    clear_busy();
 }
+
+
 
 void android_main(struct android_app *state) {
 #ifndef ML_LUMIN
