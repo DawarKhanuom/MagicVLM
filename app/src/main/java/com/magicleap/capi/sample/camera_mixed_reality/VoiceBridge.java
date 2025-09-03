@@ -1,6 +1,3 @@
-// Copyright 2025 Dawar Khan (KAUST)
-// Adapted from Alpha Cephei Vosk Demo and Magic Leap C API integration
-
 package com.magicleap.capi.sample.camera_mixed_reality;
 
 import android.Manifest;
@@ -8,15 +5,21 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.text.InputType;
 import android.util.Log;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
+
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -43,12 +46,11 @@ public class VoiceBridge {
 
     private static final String TAG = "VoiceBridge";
     private static final boolean ALWAYS_USE_VOSK = true;
-
     private static final String VOSK_MODEL_RELATIVE = "models/stt/model-en-us";
 
     private final Activity activity;
 
-    // Android SpeechRecognizer
+    // Android SR
     private SpeechRecognizer recognizer;
     private Intent recognizerIntent;
 
@@ -59,21 +61,23 @@ public class VoiceBridge {
     private Recognizer voskRecognizer;
     private SpeechService voskService;
 
-    // Text-to-Speech
+    // TTS
     private TextToSpeech tts;
     private boolean ttsReady = false;
 
-    public VoiceBridge(Activity activity) {
-        this.activity = activity;
-    }
+    // Audio focus for TTS
+    private AudioManager audioManager;
+    private AudioFocusRequest focusReq;
+
+    public VoiceBridge(Activity activity) { this.activity = activity; }
 
     // ========= Lifecycle =========
-
     public void init() {
         activity.runOnUiThread(() -> {
             try {
                 LibVosk.setLogLevel(LogLevel.INFO);
                 initTTS();
+                audioManager = (AudioManager) activity.getSystemService(Activity.AUDIO_SERVICE);
 
                 if (ALWAYS_USE_VOSK) {
                     initVosk();
@@ -99,6 +103,7 @@ public class VoiceBridge {
                 if (voskRecognizer != null) { voskRecognizer.close(); voskRecognizer = null; }
                 if (voskModel != null) { voskModel.close(); voskModel = null; voskReady = false; }
                 if (tts != null) { tts.stop(); tts.shutdown(); tts = null; ttsReady = false; }
+                abandonFocus();
             } catch (Throwable t) {
                 Log.e(TAG, "destroy() exception", t);
                 nativeOnASRError("destroy() exception: " + t);
@@ -107,10 +112,10 @@ public class VoiceBridge {
     }
 
     // ========= Permissions =========
-
     public void requestPermissions() {
         activity.runOnUiThread(() -> {
-            boolean micGranted = ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+            boolean micGranted = ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED;
             if (!micGranted) {
                 ActivityCompat.requestPermissions(activity, new String[]{ Manifest.permission.RECORD_AUDIO }, 1001);
             }
@@ -118,7 +123,6 @@ public class VoiceBridge {
     }
 
     // ========= STT =========
-
     public void startListening() {
         activity.runOnUiThread(() -> {
             try {
@@ -137,29 +141,17 @@ public class VoiceBridge {
                 voskService.startListening(new org.vosk.android.RecognitionListener() {
                     @Override
                     public void onPartialResult(String hyp) {
+                        // ✅ Always forward partials (your GUI expects live updates)
                         String partial = extractText(hyp);
-                        if (partial != null && !partial.isEmpty()) {
-                            nativeOnASRResult(partial); // live partial updates
-                        }
+                        if (partial != null && !partial.isEmpty()) nativeOnASRResult(partial);
                     }
-
-                    @Override public void onTimeout() {
-                        nativeOnASRError("Timeout");
-                    }
-
-                    @Override public void onError(Exception e) {
-                        nativeOnASRError("Vosk error: " + e);
-                    }
-
-                    @Override public void onResult(String hyp) {}
-
+                    @Override public void onTimeout() { nativeOnASRError("Timeout"); }
+                    @Override public void onError(Exception e) { nativeOnASRError("Vosk error: " + e); }
+                    @Override public void onResult(String hyp) { /* sometimes final duplicates here */ }
                     @Override public void onFinalResult(String hyp) {
                         String text = extractText(hyp);
                         nativeOnASRResult(text);
-                        if (voskService != null) {
-                            voskService.stop();
-                            voskService = null;
-                        }
+                        if (voskService != null) { voskService.stop(); voskService = null; }
                     }
                 });
 
@@ -185,36 +177,6 @@ public class VoiceBridge {
         });
     }
 
-    // ========= TTS =========
-
-    public void speak(String text) {
-        activity.runOnUiThread(() -> {
-            try {
-                if (!ttsReady || tts == null) {
-                    nativeOnASRError("TTS not initialized");
-                    return;
-                }
-                tts.speak(text == null ? "" : text, TextToSpeech.QUEUE_FLUSH, null, "magic-tts-001");
-            } catch (Throwable t) {
-                nativeOnASRError("speak() error: " + t);
-            }
-        });
-    }
-
-    private void initTTS() {
-        tts = new TextToSpeech(activity.getApplicationContext(), status -> {
-            ttsReady = (status == TextToSpeech.SUCCESS);
-            if (ttsReady) {
-                int r = tts.setLanguage(Locale.getDefault());
-                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    Log.w(TAG, "TTS: language not fully supported");
-                }
-            }
-        });
-    }
-
-    // ========= SR Internals =========
-
     private void setupAndroidSR() {
         useVosk = false;
         recognizer = SpeechRecognizer.createSpeechRecognizer(activity);
@@ -229,14 +191,18 @@ public class VoiceBridge {
                 ArrayList<String> list = res.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                 nativeOnASRResult((list != null && !list.isEmpty()) ? list.get(0) : "");
             }
-            @Override public void onPartialResults(Bundle b) {}
+            @Override public void onPartialResults(Bundle b) {
+                // ✅ also forward Android partials
+                ArrayList<String> list = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (list != null && !list.isEmpty()) nativeOnASRResult(list.get(0));
+            }
             @Override public void onEvent(int e, Bundle b) {}
         });
 
         recognizerIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
-        recognizerIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+        recognizerIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true); // ✅ request partials
         recognizerIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
     }
 
@@ -248,11 +214,11 @@ public class VoiceBridge {
             if (looksLikeVoskModel(modelDir)) {
                 voskModel = new Model(modelDir.getAbsolutePath());
                 voskReady = true;
+                Log.i(TAG, "Vosk model loaded from: " + modelDir);
             } else {
-                StorageService.unpack(activity, "model-en-us", "vosk", (model) -> {
-                    voskModel = model;
-                    voskReady = true;
-                }, (ex) -> nativeOnASRError("Unpack failed: " + ex));
+                StorageService.unpack(activity, "model-en-us", "vosk",
+                        (model) -> { voskModel = model; voskReady = true; Log.i(TAG, "Vosk model unpacked"); },
+                        (ex) -> nativeOnASRError("Unpack failed: " + ex));
             }
         } catch (Throwable t) {
             nativeOnASRError("initVosk failed: " + t);
@@ -260,9 +226,9 @@ public class VoiceBridge {
     }
 
     private boolean looksLikeVoskModel(File dir) {
-        return dir.exists() && dir.isDirectory() &&
-                new File(dir, "conf/model.conf").exists() &&
-                new File(dir, "am").exists();
+        return dir.exists() && dir.isDirectory()
+                && new File(dir, "conf/model.conf").exists()
+                && new File(dir, "am").exists();
     }
 
     private static String extractText(String hypothesisJson) {
@@ -274,13 +240,107 @@ public class VoiceBridge {
         }
     }
 
-    // ========= UI helpers: virtual keyboard edit =========
+    // ========= TTS ========= (does not stop STT)
+    public void speak(String text) {
+        activity.runOnUiThread(() -> {
+            try {
+                if (!ttsReady || tts == null) {
+                    Log.e(TAG, "TTS not initialized");
+                    nativeOnASRError("TTS not initialized");
+                    return;
+                }
+                String s = (text == null) ? "" : text.trim();
+                if (s.isEmpty()) {
+                    Log.w(TAG, "TTS text is empty — skipping speak()");
+                    return;
+                }
 
-    public void showKeyboard() {
-        // Placeholder for parity if you later bind IME to a native view.
-        // The dialog below forces focus+IME, which is usually what you want.
-        activity.runOnUiThread(() -> { /* no-op */ });
+                requestFocus();
+                tts.stop(); // cancel any previous utterance
+
+                Log.i(TAG, "TTS speaking: " + s);
+                int rc;
+                if (Build.VERSION.SDK_INT >= 21) {
+                    rc = tts.speak(s, TextToSpeech.QUEUE_FLUSH, null, "magic-tts-001");
+                } else {
+                    rc = tts.speak(s, TextToSpeech.QUEUE_FLUSH, null);
+                }
+                Log.i(TAG, "tts.speak() rc=" + rc);
+                if (rc == TextToSpeech.ERROR) nativeOnASRError("TTS speak() returned ERROR");
+
+            } catch (Throwable t) {
+                Log.e(TAG, "TTS speak() error", t);
+                nativeOnASRError("speak() error: " + t);
+            }
+        });
     }
+
+    private void initTTS() {
+        // Activity context sometimes routes better
+        tts = new TextToSpeech(activity, status -> {
+            ttsReady = (status == TextToSpeech.SUCCESS);
+            Log.i(TAG, "TTS init status=" + status + " ready=" + ttsReady);
+            if (ttsReady) {
+                int r = tts.setLanguage(Locale.getDefault());
+                Log.i(TAG, "TTS language set result=" + r);
+                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Log.w(TAG, "TTS: language not fully supported");
+                }
+
+                // Route as accessibility speech (swap to USAGE_MEDIA if needed)
+                if (Build.VERSION.SDK_INT >= 21) {
+                    tts.setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build());
+                }
+                tts.setPitch(1.0f);
+                tts.setSpeechRate(1.0f);
+
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String u) { Log.i(TAG, "TTS onStart: " + u); }
+                    @Override public void onDone(String u)  { Log.i(TAG, "TTS onDone: " + u); abandonFocus(); }
+                    @Override public void onError(String u) { Log.e(TAG, "TTS onError: " + u); abandonFocus(); }
+                    @Override public void onError(String u, int code) { Log.e(TAG, "TTS onError: " + u + " code=" + code); abandonFocus(); }
+                });
+
+                Log.i(TAG, "TTS ready.");
+            } else {
+                Log.e(TAG, "TTS init failed: " + status);
+            }
+        });
+    }
+
+    // ========= Audio focus helpers (TTS)
+    private void requestFocus() {
+        if (audioManager == null) return;
+        if (Build.VERSION.SDK_INT >= 26) {
+            if (focusReq == null) {
+                focusReq = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build())
+                        .build();
+            }
+            audioManager.requestAudioFocus(focusReq);
+        } else {
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+        }
+    }
+
+    private void abandonFocus() {
+        if (audioManager == null) return;
+        if (Build.VERSION.SDK_INT >= 26 && focusReq != null) {
+            audioManager.abandonAudioFocusRequest(focusReq);
+        } else {
+            audioManager.abandonAudioFocus(null);
+        }
+    }
+
+    // ========= UI helpers =========
+    public void showKeyboard() { activity.runOnUiThread(() -> { /* no-op */ }); }
 
     public void openEditDialog(String initial) {
         activity.runOnUiThread(() -> {
@@ -290,18 +350,17 @@ public class VoiceBridge {
             input.setSelection(input.getText().length());
 
             AlertDialog dialog = new AlertDialog.Builder(activity)
-                .setTitle("Edit question")
-                .setView(input)
-                .setPositiveButton("Save", (d, w) -> {
-                    String text = input.getText() == null ? "" : input.getText().toString();
-                    nativeOnASRResult(text);  // send back to native to update the ImGui text box
-                })
-                .setNegativeButton("Cancel", null)
-                .create();
+                    .setTitle("Edit question")
+                    .setView(input)
+                    .setPositiveButton("Save", (d, w) -> {
+                        String text = input.getText() == null ? "" : input.getText().toString();
+                        nativeOnASRResult(text);
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .create();
 
             dialog.show();
 
-            // Force focus + show IME
             input.post(() -> {
                 input.requestFocus();
                 InputMethodManager imm = (InputMethodManager) activity.getSystemService(Activity.INPUT_METHOD_SERVICE);
