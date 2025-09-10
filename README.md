@@ -64,3 +64,10 @@ adb uninstall com.magicleap.capi.sample.camera_mixed_reality
 
 ## Models path 
 pull /storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models 
+
+## Vosk Models path (STT -Speech to text)
+pull /storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/models/stt 
+
+## Images for time testing 
+pull /storage/emulated/0/Android/data/com.magicleap.capi.sample.camera_mixed_reality/files/images  
+

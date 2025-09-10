@@ -130,23 +130,31 @@ static jobject g_VoiceBridgeObj = nullptr;
 
 
 static inline void ClearForMR() {
-#ifdef ML_LUMIN
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST);
-
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDepthMask(GL_TRUE);
-
-    // Black, transparent: adds nothing to the camera feed
-    glClearColor(0.f, 0.f, 0.f, 0.f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    // IMPORTANT: Re-enable blending so translucent things (ImGui, thin lines) don’t write opaque RGB
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-#endif
+//#ifdef ML_LUMIN
+//    glDisable(GL_SCISSOR_TEST);
+//    glDisable(GL_STENCIL_TEST);
+//
+//    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+//    glDepthMask(GL_TRUE);
+//
+//    // Black, transparent: adds nothing to the camera feed
+//    glClearColor(0.f, 0.f, 0.f, 0.f);
+//    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+//
+//    // IMPORTANT: Re-enable blending so translucent things (ImGui, thin lines) don’t write opaque RGB
+//    glEnable(GL_BLEND);
+//    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+//#endif
 }
 
+static inline void ImageRectOnPad(float hx, float hy, float aspect, float& sx, float& sy) {
+    // fits a width:height = aspect:1 image inside a pad with half sizes (hx,hy)
+    // returns half sizes (sx, sy) of the image rect inside the pad
+    aspect = std::max(1e-6f, aspect);
+    float s = std::min(hy, hx / aspect); // uniform scale to fit
+    sx = s * aspect;
+    sy = s;
+}
 
 
 
@@ -172,6 +180,9 @@ static bool LoadTextureFromFileRGBA8888(const std::string& path,
     return true;
 }
 #endif
+
+
+
 
 static inline ImVec2 Clamp01(ImVec2 p) {
     return ImVec2(std::min(1.f, std::max(0.f, p.x)),
@@ -495,20 +506,44 @@ public:
 
 
 
-        // Handle the "capture -> wait for question" flow
+
         if (awaiting_auto_question_) {
+
             awaiting_timer_s_ += dt;
-            // If user finished speaking and there is text, send it
-            bool has_transcript = false;
+            since_last_asr_s_ += dt;
+
+            std::string transcript;
             {
                 std::lock_guard<std::mutex> lk(g_asrMutex);
-                has_transcript = !g_lastASR.empty();
-                // don't clear here; UpdateGui reads and clears it
+                if (!g_lastASR.empty()) {
+                    transcript.swap(g_lastASR); // take and clear
+                }
             }
-            if (has_transcript) {
-                // let UpdateGui pull it into question_buf_; send next frame
-            } else if (awaiting_timer_s_ >= auto_wait_timeout_s_) {
-                // Timeout -> use whatever is in the box or fallback default
+
+            if (!transcript.empty()) {
+                // Show the latest transcript in the text box
+                heard_any_asr_ = true;  // NEW
+                std::strncpy(question_buf_, transcript.c_str(), sizeof(question_buf_) - 1);
+                question_buf_[sizeof(question_buf_) - 1] = '\0';
+                since_last_asr_s_ = 0.0f;
+
+                // If we are *not* in "listen until silence" mode, send immediately
+                if (!listen_until_silence_) {
+                    if (!last_captured_image_.empty()) {
+                        std::string img = last_captured_image_;
+                        std::thread([this, img, transcript]() { InitializeONNX(img, transcript); }).detach();
+                    }
+                    awaiting_auto_question_ = false;
+                    pending_voice_question_ = false;
+                    StopListening();
+                }
+            }
+
+            const bool timed_out        = (awaiting_timer_s_ >= auto_wait_timeout_s_);
+            const bool silence_finished = (listen_until_silence_ && heard_any_asr_ && since_last_asr_s_ >= silence_grace_s_); // NEW
+
+
+            if (timed_out || silence_finished) {
                 std::string q = question_buf_;
                 if (q.empty()) q = "What is in the image?";
                 if (!last_captured_image_.empty()) {
@@ -520,6 +555,9 @@ public:
                 StopListening();
             }
         }
+
+
+
 
 
 
@@ -540,6 +578,43 @@ public:
     void Speak(const std::string& text);
 
 private:
+    bool heard_any_asr_ = false; // reset per capture
+
+
+    // in class CameraMixedRealityApp (private:)
+    struct NormCrop {
+        ImVec2 ctr{0.5f, 0.5f};
+        ImVec2 size{0.35f, 0.35f};
+        bool   locked = false;
+    } crop_at_shutter_;
+
+
+
+    // class member:
+    float latest_image_aspect_ = 1.0f;
+    // Add to class (private):
+    void SyncCropSizeFromHUD(bool force=false) {
+        static glm::vec2 prev = {-1.f, -1.f};
+        const float base_w = std::max(aim_pad_base_size_m_.x, 1e-6f);
+        const float base_h = std::max(aim_pad_base_size_m_.y, 1e-6f);
+        auto clamp01 = [](float v){ return std::min(0.98f, std::max(0.05f, v)); };
+
+        if (force || fabsf(aim_pad_size_m_.x - prev.x) > 1e-4f) {
+            crop_norm_size_.x = clamp01(0.35f * (aim_pad_size_m_.x / base_w));
+            prev.x = aim_pad_size_m_.x;
+        }
+        if (force || fabsf(aim_pad_size_m_.y - prev.y) > 1e-4f) {
+            crop_norm_size_.y = clamp01(0.35f * (aim_pad_size_m_.y / base_h));
+            prev.y = aim_pad_size_m_.y;
+        }
+
+        // keep center inside after any size change
+        ImVec2 halfN(0.5f * crop_norm_size_.x, 0.5f * crop_norm_size_.y);
+        crop_norm_center_.x = std::min(1.f - halfN.x, std::max(halfN.x, crop_norm_center_.x));
+        crop_norm_center_.y = std::min(1.f - halfN.y, std::max(halfN.y, crop_norm_center_.y));
+        UpdateWorldCropFrame();
+    }
+
     // ----- Simple UI / visuals -----
     bool simple_ui_            = true;   // show a minimal GUI
     bool show_capture_button_  = false;  // HIDE the floating gaze button quad
@@ -577,8 +652,11 @@ private:
     std::shared_ptr<ml::app_framework::FlatMaterial> aim_reticle_mat_;
 
     bool  use_gaze_reticle_   = true;   // toggle in UI if you want
-    float aim_pad_distance_m_ = 0.55f;  // distance from head
-    glm::vec2 aim_pad_size_m_ = {0.22f, 0.14f}; // W x H (meters)
+    float aim_pad_distance_m_ = 0.95f;  // distance from head
+    glm::vec2 aim_pad_size_m_ = {0.64f, 0.64f}; // W x H (meters)
+
+    const glm::vec2 aim_pad_base_size_m_ = {0.64f, 0.64f}; // NEW: reference for mapping HUD→crop
+
 
     bool       gaze_on_pad_   = false;
     glm::vec2  cur_pad_local_ = {0.0f, 0.0f};   // local coords of current gaze hit (meters in pad space)
@@ -624,10 +702,17 @@ private:
     glm::vec2 last_click_local_{0.0f, 0.0f}; // range ≈ [-half.x..+half.x], [-half.y..+half.y]
     //........................
     // --- Auto-capture behavior ---
-    bool  wait_after_auto_capture_ = true;  // if true: capture → (listen/wait) → send
-    float auto_wait_timeout_s_     = 5.0f;  // fallback to default Q after this
-    bool  awaiting_auto_question_  = false; // we’re in the post-capture wait
-    float awaiting_timer_s_        = 0.0f;  // counts while waiting
+    // --- Auto-capture behavior ---
+    bool  wait_after_auto_capture_ = true;   // capture → listen for question
+    float auto_wait_timeout_s_     = 5.0f;   // max overall wait before fallback
+    bool  awaiting_auto_question_  = false;  // currently listening/waiting
+    float awaiting_timer_s_        = 0.0f;   // counts while waiting
+
+// NEW: listen-until-silence behavior
+    bool  listen_until_silence_    = true;   // if true: keep listening while the user speaks
+    float silence_grace_s_         = 1.2f;   // consider it "done" after this much silence
+    float since_last_asr_s_        = 0.0f;   // time since the last ASR text arrived
+
 
     // Material so we can highlight on hover
     std::shared_ptr<ml::app_framework::FlatMaterial> capture_button_mat_;
@@ -867,12 +952,10 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         capture_button_node_->SetWorldRotation(rot);
     }
     if (rc_btn) {
-        // Step 3(a): hide old "black rectangle" unless explicitly enabled
         rc_btn->SetVisible(show_capture_button_ && use_gaze_capture_);
     }
 
-    // --- Head-locked aim pad + red reticle (always active if nodes exist) ---
-    // 1) Head pose
+    // --- Head-locked aim pad + red reticle (pad stays INVISIBLE; only edges show) ---
     MLSnapshot* snap = nullptr;
     MLTransform head{};
     bool have_head = false;
@@ -882,24 +965,36 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         }
     }
 
-    // 2) Place the pad in front-right of head, facing you (nearly transparent)
     if (have_head && aim_pad_node_) {
         glm::vec3 hpos = ml::app_framework::to_glm(head.position);
         glm::quat hrot = ml::app_framework::to_glm(head.rotation);
         glm::vec3 hfwd = glm::normalize(hrot * glm::vec3(0,0,-1));
-        glm::vec3 hup  = glm::normalize(hrot * glm::vec3(0,1,0));
-        glm::vec3 hrt  = glm::normalize(glm::cross(hfwd, hup));
 
-        // Honor live size edits
+        // Keep pad centered in front of you
         aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
 
-        glm::vec3 pad_pos = hpos + hfwd * aim_pad_distance_m_ + hrt * 0.22f; // offset right a touch
-        glm::quat pad_rot = LookRotation(-hfwd);
+// Map HUD size (meters) → crop size (normalized 0..1), preserving aspect
+        { SyncCropSizeFromHUD();
 
+        }
+
+
+
+
+        glm::vec3 pad_pos = hpos + hfwd * aim_pad_distance_m_;
+        glm::quat pad_rot = LookRotation(-hfwd);
         aim_pad_node_->SetWorldTranslation(pad_pos);
         aim_pad_node_->SetWorldRotation(pad_rot);
 
-        // 3) Ray vs. pad to place the red dot (reticle)
+        // IMPORTANT: keep aim pad QUAD invisible (no fill)
+        if (auto pad_rc = aim_pad_node_->GetComponent<RenderableComponent>()) {
+            pad_rc->SetVisible(false);                 // <— don’t render the pad
+        }
+        if (aim_pad_mat_) {
+            aim_pad_mat_->SetColor(glm::vec4(1,1,1,0.0f)); // <— fully transparent, no tint
+        }
+
+        // Ray vs. pad to place the red dot (reticle)
         bool show_reticle = false;
         if (have_gaze && aim_reticle_node_) {
             glm::vec2 half = glm::vec2(fabsf(aim_pad_node_->GetLocalScale().x) * 0.5f,
@@ -908,7 +1003,6 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
             gaze_on_pad_ = HitQuadLocal(o, glm::normalize(d), pad_pos, pad_rot, half, hit_local);
 
             if (gaze_on_pad_) {
-                // nudge above plane to avoid z-fighting
                 aim_reticle_node_->SetLocalTranslation(glm::vec3(hit_local.x, hit_local.y, 0.001f));
                 cur_pad_local_ = hit_local;
                 show_reticle   = true;
@@ -922,7 +1016,6 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         if (auto rrc = aim_reticle_node_
                        ? aim_reticle_node_->GetComponent<RenderableComponent>()
                        : nullptr) {
-            // show only if toggle is on and we actually have a hit
             rrc->SetVisible(use_gaze_reticle_ && show_reticle);
         }
     } else {
@@ -935,21 +1028,39 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
     }
     if (snap) MLPerceptionReleaseSnapshot(snap);
 
-    // --- Drive GUI crop rect from gaze on the pad (no click required) ---
+    // --- Drive crop rect from gaze on the (invisible) pad; update red border edges ---
     if (use_crop_gui_ && crop_with_gaze_ && gaze_on_pad_ && aim_pad_node_) {
         glm::vec2 halfPad = glm::vec2(fabsf(aim_pad_node_->GetLocalScale().x) * 0.5f,
                                       fabsf(aim_pad_node_->GetLocalScale().y) * 0.5f);
 
-        float u01 = 0.5f + 0.5f * (cur_pad_local_.x / std::max(halfPad.x, 1e-6f));
-        float v01 = 0.5f - 0.5f * (cur_pad_local_.y / std::max(halfPad.y, 1e-6f));
+        const float hx = halfPad.x;
+        const float hy = halfPad.y;
+
+        float aspect = latest_image_aspect_;
+        if (!(aspect > 0.f)) {
+            aspect = (capture_width_ > 0 && capture_height_ > 0)
+                     ? (float)capture_width_ / (float)capture_height_
+                     : 1.0f;
+        }
+
+        float sx=0.f, sy=0.f;
+        ImageRectOnPad(hx, hy, aspect, sx, sy);
+
+// map gaze hit inside the *image rect* (±sx, ±sy) → [0..1]
+        float u = cur_pad_local_.x / std::max(1e-6f, sx);
+        float v = cur_pad_local_.y / std::max(1e-6f, sy);
+        u = std::min(1.f, std::max(-1.f, u));
+        v = std::min(1.f, std::max(-1.f, v));
+
+        float u01 = 0.5f + 0.5f * u;
+        float v01 = 0.5f - 0.5f * v;
         last_pad_uv01_ = ImVec2(u01, v01);
 
-        // clamp rect inside the image
         ImVec2 halfN(0.5f * crop_norm_size_.x, 0.5f * crop_norm_size_.y);
-        crop_norm_center_.x = std::min(1.f - halfN.x, std::max(halfN.x, last_pad_uv01_.x));
-        crop_norm_center_.y = std::min(1.f - halfN.y, std::max(halfN.y, last_pad_uv01_.y));
+        crop_norm_center_.x = std::min(1.f - halfN.x, std::max(halfN.x, u01));
+        crop_norm_center_.y = std::min(1.f - halfN.y, std::max(halfN.y, v01));
 
-        // Step 3(b): keep the *world* red rectangle synced with this normalized crop
+        // This moves the 4 red edge quads (border only)
         UpdateWorldCropFrame();
     }
 
@@ -958,12 +1069,11 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         if (auto rcRay = gaze_ray_node_->GetComponent<RenderableComponent>()) {
             rcRay->SetVisible(show_gaze_ray_ && have_gaze);
             if (show_gaze_ray_ && have_gaze) {
-                // Color intensity gated by fixation (updated below)
                 const float len = std::max(0.05f, glm::length(
                         (capture_button_node_ ? capture_button_node_->GetWorldTranslation() : (o + d * 0.6f)) - o));
-                gaze_ray_node_->SetWorldRotation(LookRotationY(d));           // local +Y along ray
-                gaze_ray_node_->SetWorldTranslation(o + d * (len * 0.5f));    // center the strip
-                gaze_ray_node_->SetLocalScale(glm::vec3(0.003f, len, 0.001f));// thickness x length x tiny
+                gaze_ray_node_->SetWorldRotation(LookRotationY(d));
+                gaze_ray_node_->SetWorldTranslation(o + d * (len * 0.5f));
+                gaze_ray_node_->SetLocalScale(glm::vec3(0.003f, len, 0.001f));
                 if (gaze_ray_mat_) {
                     gaze_ray_mat_->SetColor((fixate_timer_ms_ >= fixate_ms_needed_)
                                             ? glm::vec4(1,1,1,0.65f)
@@ -973,7 +1083,7 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         }
     }
 
-    // --- Fixation gate (used for “almost there” UI and dwell mode) ---
+    // --- Fixation gate ---
     bool fixation_ok = false;
     if (have_gaze) {
         if (fixate_timer_ms_ <= 0.f) fixate_ref_dir_ = d;
@@ -992,7 +1102,7 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         fixation_ok = false;
     }
 
-    // --- If you keep the old dwell-to-click, it only works when button is visible ---
+    // --- Dwell-to-click over the floating button (optional) ---
     bool gaze_hits_button = false;
     glm::vec2 hit_local_btn(0.0f);
     if (show_capture_button_ && use_gaze_capture_ && have_gaze && capture_button_node_) {
@@ -1004,21 +1114,18 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
         const bool hits_quad = HitQuadLocal(o, glm::normalize(d), bpos, brot, half, hit_local_btn);
         gaze_hits_button = fixation_ok && hits_quad;
 
-        // Visual feedback on the button
         if (capture_button_mat_) {
             const glm::vec4 col = gaze_hits_button
-                                  ? glm::vec4(0.20f, 1.00f, 0.20f, 0.95f)            // green: clickable
-                                  : (fixation_ok ? glm::vec4(1.00f, 0.85f, 0.20f, 0.95f) // yellow: almost
-                                                 : glm::vec4(1.00f, 1.00f, 1.00f, 0.90f)); // white: idle
+                                  ? glm::vec4(0.20f, 1.00f, 0.20f, 0.95f)
+                                  : (fixation_ok ? glm::vec4(1.00f, 0.85f, 0.20f, 0.95f)
+                                                 : glm::vec4(1.00f, 1.00f, 1.00f, 0.90f));
             capture_button_mat_->SetColor(col);
         }
     } else if (capture_button_mat_) {
-        // keep color neutral when hidden/off
         capture_button_mat_->SetColor(glm::vec4(1.00f, 1.00f, 1.00f, 0.90f));
     }
     gaze_over_button_ = gaze_hits_button;
 
-    // --- Eyes-only dwell-to-click (optional): only if the button is visible ---
     if (auto_dwell_snap_ && gaze_hits_button) {
         dwell_timer_ms_ += dt_seconds * 1000.f;
         if (dwell_timer_ms_ >= dwell_ms_needed_) {
@@ -1033,33 +1140,35 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
                 typed_question_            = question_buf_;
             }
 
-
             have_last_click_local_ = true;
             last_click_local_      = hit_local_btn;
 
-            // NEW: snapshot the current gaze UV for crop-at-gaze
+            // Snapshot gaze → crop-at-gaze BEFORE capture
             if (gaze_on_pad_) {
                 have_last_pad_uv_ = true;
                 last_pad_uv_ = glm::vec2(
                         (last_pad_uv01_.x - 0.5f) * 2.0f,
-                        (0.5f - last_pad_uv01_.y) * 2.0f   // flip Y
+                        (0.5f - last_pad_uv01_.y) * 2.0f
                 );
             } else {
                 have_last_pad_uv_ = false;
             }
 
 
-
-            last_click_local_      = hit_local_btn;
+            // right before UNWRAP_MLRESULT(CaptureImage());
+            crop_at_shutter_.ctr  = crop_norm_center_;
+            crop_at_shutter_.size = crop_norm_size_;
+            crop_at_shutter_.locked = true;
 
             UNWRAP_MLRESULT(CaptureImage());
+
             dwell_timer_ms_ = 0.f;
         }
     } else {
         dwell_timer_ms_ = 0.f;
     }
 
-    // --- Controller: resize crop when looking at the pad (bumper/trigger) ---
+    // --- Controller: resize crop when looking at the pad (bumper/trigger) + trigger capture ---
     if (input_handle_ != ML_INVALID_HANDLE) {
         MLInputControllerStateEx st[MLInput_MaxControllers];
         MLInputControllerStateExInit(st);
@@ -1072,41 +1181,48 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
             const float trig   = have ? st[use_i].trigger_normalized : 0.0f; // 0..1
             const bool  bumper = have ? st[use_i].button_state[MLInputControllerButton_Bumper] : false;
 
-            // Resize crop while gazing at the pad
+            // Resize HUD while gazing at the pad (crop follows via HUD→crop mapping)
             if (use_crop_gui_ && crop_with_gaze_ && gaze_on_pad_) {
-                bool trigDown = (trig >= 0.85f);
-                bool bumDown  = bumper;
-                const float minS = 0.06f, maxS = 0.98f;
 
-                if (trigDown || bumDown) {
-                    float u = last_pad_uv01_.x;
-                    float v = last_pad_uv01_.y;
+                // --- Controller: resize HUD only if bumper is down; trigger-only is capture ---
+                const bool trigDown = (trig >= 0.85f);
+                const bool bumDown  = bumper;
+
+// Resize HUD while gazing at the pad (crop follows via HUD→crop mapping)
+                if (use_crop_gui_ && crop_with_gaze_ && gaze_on_pad_ && bumDown) {
+                    const float u = last_pad_uv01_.x;
+                    const float v = last_pad_uv01_.y;
+                    const glm::vec2 minHud(0.10f, 0.10f), maxHud(1.20f, 1.20f);
+                    const float k = 0.35f;
+                    const float base_w = std::max(aim_pad_base_size_m_.x, 1e-6f);
+                    const float base_h = std::max(aim_pad_base_size_m_.y, 1e-6f);
+                    auto clamp_norm = [](float x){ return std::min(0.98f, std::max(0.05f, x)); };
+
                     if (bumDown && !trigDown) {
-                        // width only
-                        float newW = 2.0f * fabsf(u - crop_norm_center_.x);
-                        crop_norm_size_.x = std::min(maxS, std::max(minS, newW));
-                    } else if (trigDown && !bumDown) {
-                        // height only
-                        float newH = 2.0f * fabsf(v - crop_norm_center_.y);
-                        crop_norm_size_.y = std::min(maxS, std::max(minS, newH));
-                    } else {
-                        // both held → scale both
-                        float newW = 2.0f * fabsf(u - crop_norm_center_.x);
-                        float newH = 2.0f * fabsf(v - crop_norm_center_.y);
-                        crop_norm_size_.x = std::min(maxS, std::max(minS, newW));
-                        crop_norm_size_.y = std::min(maxS, std::max(minS, newH));
+                        // Width only (bumper)
+                        float desired_norm_w = clamp_norm(2.0f * fabsf(u - crop_norm_center_.x));
+                        float new_w_m = (desired_norm_w / k) * base_w;
+                        aim_pad_size_m_.x = std::min(maxHud.x, std::max(minHud.x, new_w_m));
+                    } else if (bumDown && trigDown) {
+                        // Width + height (both)
+                        float desired_norm_w = clamp_norm(2.0f * fabsf(u - crop_norm_center_.x));
+                        float desired_norm_h = clamp_norm(2.0f * fabsf(v - crop_norm_center_.y));
+                        float new_w_m = (desired_norm_w / k) * base_w;
+                        float new_h_m = (desired_norm_h / k) * base_h;
+                        aim_pad_size_m_.x = std::min(maxHud.x, std::max(minHud.x, new_w_m));
+                        aim_pad_size_m_.y = std::min(maxHud.y, std::max(minHud.y, new_h_m));
                     }
-                    // keep rect inside bounds
-                    ImVec2 halfN(0.5f * crop_norm_size_.x, 0.5f * crop_norm_size_.y);
-                    crop_norm_center_.x = std::min(1.f - halfN.x, std::max(halfN.x, crop_norm_center_.x));
-                    crop_norm_center_.y = std::min(1.f - halfN.y, std::max(halfN.y, crop_norm_center_.y));
 
-                    // keep world overlay in sync
-                    UpdateWorldCropFrame();
+                    if (aim_pad_node_) {
+                        aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
+                    }
+                    SyncCropSizeFromHUD(true);
                 }
+
             }
 
-            // --- Step 3(c): Trigger to capture ANYWHERE (no on-screen button) ---
+
+            // Trigger to capture anywhere
             const bool down = (trig >= 0.85f) || bumper;
             trigger_click_.cooldown_ms = std::max(0.f, trigger_click_.cooldown_ms - dt_seconds * 1000.f);
 
@@ -1121,182 +1237,171 @@ void CameraMixedRealityApp::UpdateGazeButtonAndTrigger(float dt_seconds) {
                     pending_voice_question_    = false;
                     typed_question_            = question_buf_;
                 }
+
+                // Snapshot gaze BEFORE capture for crop-at-gaze
+                if (gaze_on_pad_) {
+                    have_last_pad_uv_ = true;
+                    last_pad_uv_ = glm::vec2(
+                            (last_pad_uv01_.x - 0.5f) * 2.0f,
+                            (0.5f - last_pad_uv01_.y) * 2.0f
+                    );
+                } else {
+                    have_last_pad_uv_ = false;
+                }
+
+
+                // right before UNWRAP_MLRESULT(CaptureImage());
+                crop_at_shutter_.ctr  = crop_norm_center_;
+                crop_at_shutter_.size = crop_norm_size_;
+                crop_at_shutter_.locked = true;
+
                 UNWRAP_MLRESULT(CaptureImage());
+
                 trigger_click_.cooldown_ms = 250.f;
-
-//                if (!trigger_to_capture_ && down && !trigger_click_.was_down && gaze_hits_button) {
-//                    UNWRAP_MLRESULT(CaptureImage());
-//                    trigger_click_.cooldown_ms = 250.f;
-//                }
-
             }
             trigger_click_.was_down = down;
-
-            // Legacy path (press must be over the button) if you ever disable "trigger_to_capture_"
-            if (!trigger_to_capture_) {
-                // Keep your older “if (down edge && gaze_hits_button) capture …” here if desired.
-            }
-
-
-
-
-
-
-            // NEW: snapshot the current gaze UV for crop-at-gaze
-            if (gaze_on_pad_) {
-                have_last_pad_uv_ = true;
-                last_pad_uv_ = glm::vec2(
-                        (last_pad_uv01_.x - 0.5f) * 2.0f,
-                        (0.5f - last_pad_uv01_.y) * 2.0f
-                );
-            } else {
-                have_last_pad_uv_ = false;
-            }
-
-//            UNWRAP_MLRESULT(CaptureImage());
-//            trigger_click_.cooldown_ms = 250.f;
         }
     }
 }
 
+
 //...................... end of button trigger................................
 
- //...............................................................
- void CameraMixedRealityApp::SetupSceneNodes() {
-     using namespace ml::app_framework;
+//...............................................................
+void CameraMixedRealityApp::SetupSceneNodes() {
+    using namespace ml::app_framework;
 
-     // --- Capture button (create once) ---
-     if (!capture_button_node_) {
-         capture_button_node_ = std::make_shared<Node>();
-         GetRoot()->AddChild(capture_button_node_);
+    // --- Capture button (create once) ---
+    if (!capture_button_node_) {
+        capture_button_node_ = std::make_shared<Node>();
+        GetRoot()->AddChild(capture_button_node_);
 
-         static std::shared_ptr<QuadMesh> button_mesh = std::make_shared<QuadMesh>(); // unit quad
-         capture_button_mat_ = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.0f, 0.0f, 0.9f)); // red
+        static std::shared_ptr<QuadMesh> button_mesh = std::make_shared<QuadMesh>(); // unit quad
+        capture_button_mat_ = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.0f, 0.0f, 0.9f)); // red
 
-         auto renderable = std::make_shared<RenderableComponent>(button_mesh, capture_button_mat_);
-         capture_button_node_->AddComponent(renderable);
+        auto renderable = std::make_shared<RenderableComponent>(button_mesh, capture_button_mat_);
+        capture_button_node_->AddComponent(renderable);
 
-         // ~12cm x 5cm quad (depth tiny)
-         capture_button_node_->SetLocalScale(glm::vec3(0.12f, 0.05f, 0.005f));
-         renderable->SetVisible(false);
-     }
+        // ~12cm x 5cm quad (depth tiny)
+        capture_button_node_->SetLocalScale(glm::vec3(0.12f, 0.05f, 0.005f));
+        renderable->SetVisible(false);
+    }
 
-     // --- Gaze "laser" (create once) ---
-     if (!gaze_ray_node_) {
-         auto ray_mesh = std::make_shared<QuadMesh>();
-         gaze_ray_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 1.0f, 1.0f, 0.55f));
-         gaze_ray_node_ = std::make_shared<Node>();
-         auto ray_rc    = std::make_shared<RenderableComponent>(ray_mesh, gaze_ray_mat_);
-         gaze_ray_node_->AddComponent(ray_rc);
-         GetRoot()->AddChild(gaze_ray_node_);
+    // --- Gaze "laser" (create once) ---
+    if (!gaze_ray_node_) {
+        auto ray_mesh = std::make_shared<QuadMesh>();
+        gaze_ray_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 1.0f, 1.0f, 0.55f));
+        gaze_ray_node_ = std::make_shared<Node>();
+        auto ray_rc    = std::make_shared<RenderableComponent>(ray_mesh, gaze_ray_mat_);
+        gaze_ray_node_->AddComponent(ray_rc);
+        GetRoot()->AddChild(gaze_ray_node_);
 
-         // Tall axis = local +Y. We'll rescale/position/rotate every frame.
-         gaze_ray_node_->SetLocalScale(glm::vec3(0.003f, 0.6f, 0.001f));
-         ray_rc->SetVisible(false);
-     }
-     if (!aim_pad_node_) {
-         aim_pad_node_ = std::make_shared<Node>();
-         GetRoot()->AddChild(aim_pad_node_);
+        // Tall axis = local +Y. We'll rescale/position/rotate every frame.
+        gaze_ray_node_->SetLocalScale(glm::vec3(0.003f, 0.6f, 0.001f));
+        ray_rc->SetVisible(false);
+    }
+    if (!aim_pad_node_) {
+        aim_pad_node_ = std::make_shared<Node>();
+        GetRoot()->AddChild(aim_pad_node_);
 
-         auto pad_mesh = std::make_shared<QuadMesh>();                 // unit quad
-         aim_pad_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1,1,1,0.03f)); // nearly invisible
-         auto pad_rc   = std::make_shared<RenderableComponent>(pad_mesh, aim_pad_mat_);
-         aim_pad_node_->AddComponent(pad_rc);
-
-
-
-         aim_pad_mat_->SetColor(glm::vec4(1,1,1,0.0f));
-         pad_rc->SetVisible(false);
+        auto pad_mesh = std::make_shared<QuadMesh>();                 // unit quad
+        aim_pad_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1,1,1,0.03f)); // nearly invisible
+        auto pad_rc   = std::make_shared<RenderableComponent>(pad_mesh, aim_pad_mat_);
+        aim_pad_node_->AddComponent(pad_rc);
 
 
 
-         // scale to desired size (meters)
-         aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
+        aim_pad_mat_->SetColor(glm::vec4(1,1,1,0.0f));
+        pad_rc->SetVisible(false);
 
-         // child: red reticle (small dot)
-         aim_reticle_node_ = std::make_shared<Node>();
-         auto ret_mesh     = std::make_shared<QuadMesh>();
-         aim_reticle_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.15f, 0.15f, 0.95f)); // red
-         auto ret_rc       = std::make_shared<RenderableComponent>(ret_mesh, aim_reticle_mat_);
-         aim_reticle_node_->AddComponent(ret_rc);
-         aim_pad_node_->AddChild(aim_reticle_node_);
 
-         // ~1.5 cm dot
-         aim_reticle_node_->SetLocalScale(glm::vec3(0.015f, 0.015f, 0.001f));
-         ret_rc->SetVisible(false); // hidden until gaze hits pad
-     }
+
+        // scale to desired size (meters)
+        aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
+
+        // child: red reticle (small dot)
+        aim_reticle_node_ = std::make_shared<Node>();
+        auto ret_mesh     = std::make_shared<QuadMesh>();
+        aim_reticle_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.15f, 0.15f, 0.95f)); // red
+        auto ret_rc       = std::make_shared<RenderableComponent>(ret_mesh, aim_reticle_mat_);
+        aim_reticle_node_->AddComponent(ret_rc);
+        aim_pad_node_->AddChild(aim_reticle_node_);
+
+        // ~1.5 cm dot
+        aim_reticle_node_->SetLocalScale(glm::vec3(0.015f, 0.015f, 0.001f));
+        ret_rc->SetVisible(false); // hidden until gaze hits pad
+    }
 
 // --- World crop frame (child of the head-locked aim pad) ---
-     if (!crop_frame_node_) {
-         using namespace ml::app_framework;
-         crop_frame_node_ = std::make_shared<Node>();
-         if (!aim_pad_node_) {
-             // create aim pad if not yet created (safety)
-             aim_pad_node_ = std::make_shared<Node>();
-             GetRoot()->AddChild(aim_pad_node_);
-             auto pad_mesh = std::make_shared<QuadMesh>();
-             aim_pad_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1,1,1,0.0f)); // fully invisible pad
-             auto pad_rc   = std::make_shared<RenderableComponent>(pad_mesh, aim_pad_mat_);
-             aim_pad_node_->AddComponent(pad_rc);
-             aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
-         }
-         aim_pad_node_->AddChild(crop_frame_node_);
+    if (!crop_frame_node_) {
+        using namespace ml::app_framework;
+        crop_frame_node_ = std::make_shared<Node>();
+        if (!aim_pad_node_) {
+            // create aim pad if not yet created (safety)
+            aim_pad_node_ = std::make_shared<Node>();
+            GetRoot()->AddChild(aim_pad_node_);
+            auto pad_mesh = std::make_shared<QuadMesh>();
+            aim_pad_mat_  = std::make_shared<FlatMaterial>(glm::vec4(1,0,0,1.0f)); // fully invisible pad
+            auto pad_rc   = std::make_shared<RenderableComponent>(pad_mesh, aim_pad_mat_);
+            aim_pad_node_->AddComponent(pad_rc);
+            aim_pad_node_->SetLocalScale(glm::vec3(aim_pad_size_m_.x, aim_pad_size_m_.y, 0.001f));
+        }
+        aim_pad_node_->AddChild(crop_frame_node_);
 
-         crop_edge_mat_ = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.15f, 0.15f, 0.95f)); // red
-         for (int i = 0; i < 4; ++i) {
-             auto edge = std::make_shared<Node>();
-             auto mesh = std::make_shared<QuadMesh>();
-             auto rc   = std::make_shared<RenderableComponent>(mesh, crop_edge_mat_);
-             edge->AddComponent(rc);
-             crop_frame_node_->AddChild(edge);
-             crop_edges_[i] = edge;
-             // thin by default; UpdateWorldCropFrame will size properly.
-             edge->SetLocalScale(glm::vec3(0.001f, 0.001f, 0.001f));
-             rc->SetVisible(true);
-         }
-     }
+        crop_edge_mat_ = std::make_shared<FlatMaterial>(glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
+        for (int i = 0; i < 4; ++i) {
+            auto edge = std::make_shared<Node>();
+            auto mesh = std::make_shared<QuadMesh>();
+            auto rc   = std::make_shared<RenderableComponent>(mesh, crop_edge_mat_);
+            edge->AddComponent(rc);
+            crop_frame_node_->AddChild(edge);
+            crop_edges_[i] = edge;
+            edge->SetLocalScale(glm::vec3(0.001f, 0.001f, 0.001f));
+            rc->SetVisible(true);
+        }
+    }
 
 // Ensure the world crop frame is initialized to current normalized rect
-     UpdateWorldCropFrame();
+    UpdateWorldCropFrame();
 
 
- }
+}
 //.........................................................crop start.......................
 void CameraMixedRealityApp::UpdateWorldCropFrame() {
     using namespace ml::app_framework;
     if (!aim_pad_node_ || !crop_frame_node_) return;
-    for (int i=0;i<4;++i) if (!crop_edges_[i]) return; // edges not built yet
+    for (int i=0;i<4;++i) if (!crop_edges_[i]) return;
 
-    // pad half-sizes (meters)
     const float hx = fabsf(aim_pad_node_->GetLocalScale().x) * 0.5f;
     const float hy = fabsf(aim_pad_node_->GetLocalScale().y) * 0.5f;
 
-    // center in pad local space (x right, y up)
-    const float cx = (crop_norm_center_.x - 0.5f) * 2.0f * hx;
-    const float cy = (0.5f - crop_norm_center_.y) * 2.0f * hy;
+    float aspect = latest_image_aspect_;
+    if (!(aspect > 0.f)) {
+        aspect = (capture_width_ > 0 && capture_height_ > 0)
+                 ? (float)capture_width_ / (float)capture_height_
+                 : 1.0f;
+    }
 
-    // size in pad local space (meters)
-    const float w  = std::max(0.0f, crop_norm_size_.x * 2.0f * hx);
-    const float h  = std::max(0.0f, crop_norm_size_.y * 2.0f * hy);
+    float sx=0.f, sy=0.f;
+    ImageRectOnPad(hx, hy, aspect, sx, sy);   // <- image half-sizes inside the pad
 
-    const float t  = 0.004f; // edge thickness
+    const float cx = (crop_norm_center_.x - 0.5f) * 2.0f * sx;
+    const float cy = (0.5f - crop_norm_center_.y) * 2.0f * sy;
 
-    // Indices: [0]=Left, [1]=Top, [2]=Right, [3]=Bottom
+    const float w  = std::max(0.0f, crop_norm_size_.x * 2.0f * sx);
+    const float h  = std::max(0.0f, crop_norm_size_.y * 2.0f * sy);
+
+    const float t  = 0.004f;
+
     auto set_edge = [](std::shared_ptr<Node>& n, float x, float y, float sx, float sy) {
         n->SetLocalTranslation(glm::vec3(x, y, 0.001f));
         n->SetLocalScale(glm::vec3(std::max(0.001f, sx), std::max(0.001f, sy), 0.001f));
     };
-
-    // Top
-    set_edge(crop_edges_[1], cx,           cy + h*0.5f, std::max(w, t), t);
-    // Bottom
-    set_edge(crop_edges_[3], cx,           cy - h*0.5f, std::max(w, t), t);
-    // Left
-    set_edge(crop_edges_[0], cx - w*0.5f,  cy,          t,              std::max(h, t));
-    // Right
-    set_edge(crop_edges_[2], cx + w*0.5f,  cy,          t,              std::max(h, t));
+    set_edge(crop_edges_[1], cx,          cy + h*0.5f, std::max(w, t), t); // top
+    set_edge(crop_edges_[3], cx,          cy - h*0.5f, std::max(w, t), t); // bottom
+    set_edge(crop_edges_[0], cx - w*0.5f, cy,          t,              std::max(h, t)); // left
+    set_edge(crop_edges_[2], cx + w*0.5f, cy,          t,              std::max(h, t)); // right
 }
-
 
 //.........................................................crop end....................
 
@@ -1450,18 +1555,35 @@ void CameraMixedRealityApp::UnloadVLM() {
 
 
 // ===== GUI ========================================================================
-// ===== GUI =====
-// ===== GUI =====
+// ===== GUI =====start
+
+
 void CameraMixedRealityApp::UpdateGui() {
-    // Soft rounded, semi-opaque window so MR stays visible
+    // ---------- Mic → textbox ingest (NO ImGui calls here) ----------
+    std::string asr_err_local;
+    {
+        std::lock_guard<std::mutex> lk(g_asrMutex);
+
+        if (!g_lastASR.empty()) {
+            std::string transcript = std::move(g_lastASR);
+            g_lastASR.clear();
+            std::strncpy(question_buf_, transcript.c_str(), sizeof(question_buf_) - 1);
+            question_buf_[sizeof(question_buf_) - 1] = '\0';
+
+            // keep the "listen until silence" timers sane
+            since_last_asr_s_ = 0.0f;
+            heard_any_asr_    = true;
+        }
+        if (!g_lastASRError.empty()) {
+            asr_err_local.swap(g_lastASRError); // render inside the window below
+        }
+    }
+
+    // ---------- Window styling ----------
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-//    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0.55f));
-//    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0.0f));
-
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0.0f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg,  ImVec4(0,0,0,0.0f));
-
 
     auto& gui = GetGui();
     ImGuiIO& io = ImGui::GetIO();
@@ -1476,7 +1598,7 @@ void CameraMixedRealityApp::UpdateGui() {
         applied_scale = ui_scale_;
     }
 
-    // Make the window big enough to show everything comfortably
+    // Window position/size
     ImVec2 mainSize(std::min(screen.x * 0.48f, 820.0f),
                     std::min(screen.y * 0.90f, 980.0f));
     ImGui::SetNextWindowPos(ImVec2(screen.x - 12.0f, screen.y * 0.06f),
@@ -1485,24 +1607,17 @@ void CameraMixedRealityApp::UpdateGui() {
 
     gui.BeginUpdate();
 
-//#ifdef ML_LUMIN
-//    // Ensure we really clear with alpha so the real world shows (avoid black fill)
-////    ImGui::GetForegroundDrawList()->AddCallback(
-////            [](const ImDrawList*, const ImDrawCmd*) {
-//////                glDisable(GL_BLEND);
-//////                // Clear with fully transparent background
-//////                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-//////                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-//////                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-//////                glEnable(GL_BLEND);
-////            }, nullptr);
-//#endif
-
     bool running = true;
-    if (gui.BeginDialog("MagicVLM - Simple", &running,
-                        ImGuiWindowFlags_NoCollapse |
-                        ImGuiWindowFlags_NoBackground |
-                        ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+    bool opened = gui.BeginDialog("MagicVLM - Simple", &running,
+                                  ImGuiWindowFlags_NoCollapse |
+                                  ImGuiWindowFlags_NoBackground |
+                                  ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+    if (opened) {
+        // Mic/ASR error (rendered INSIDE the window)
+        if (!asr_err_local.empty()) {
+            ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "ASR error: %s", asr_err_local.c_str());
+        }
 
         // ───────────────────────────────────────────────────────────
         // 1) CAPTURE
@@ -1511,12 +1626,23 @@ void CameraMixedRealityApp::UpdateGui() {
         if (ImGui::Button("Capture")) {
             send_to_vlm_after_capture_ = false;
             pending_voice_question_    = false;
+
+            // snapshot HUD rect used at shutter
+            crop_at_shutter_.ctr    = crop_norm_center_;
+            crop_at_shutter_.size   = crop_norm_size_;
+            crop_at_shutter_.locked = true;
+
             UNWRAP_MLRESULT(CaptureImage());
         }
         ImGui::SameLine();
         if (ImGui::Button("Capture + Voice")) {
             send_to_vlm_after_capture_ = false;
             pending_voice_question_    = true;
+
+            crop_at_shutter_.ctr    = crop_norm_center_;
+            crop_at_shutter_.size   = crop_norm_size_;
+            crop_at_shutter_.locked = true;
+
             UNWRAP_MLRESULT(CaptureImage());
         }
         ImGui::SameLine();
@@ -1524,15 +1650,26 @@ void CameraMixedRealityApp::UpdateGui() {
             send_to_vlm_after_capture_ = true;
             pending_voice_question_    = false;
             typed_question_            = question_buf_;
+
+            crop_at_shutter_.ctr    = crop_norm_center_;
+            crop_at_shutter_.size   = crop_norm_size_;
+            crop_at_shutter_.locked = true;
+
             UNWRAP_MLRESULT(CaptureImage());
         }
 
         ImGui::Separator();
 
+        ImGui::Checkbox("Wait after capture", &wait_after_auto_capture_);
+        ImGui::SameLine();
+        ImGui::Checkbox("Listen until silence", &listen_until_silence_);
+        ImGui::SliderFloat("Silence timeout (s)", &silence_grace_s_, 0.5f, 5.0f, "%.1f");
+        ImGui::SliderFloat("Max wait (s)", &auto_wait_timeout_s_, 2.0f, 20.0f, "%.1f");
+
         // ───────────────────────────────────────────────────────────
         // 2) QUESTION (TEXT + VOICE)
         // ───────────────────────────────────────────────────────────
-        ImGui::Text("2) Ask a question about the last photo");
+        ImGui::Text("2) Ask a question");
 
         // Text entry
         ImGui::InputText("Question", question_buf_, IM_ARRAYSIZE(question_buf_));
@@ -1547,16 +1684,19 @@ void CameraMixedRealityApp::UpdateGui() {
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Edit")) { OpenEditDialog(std::string(question_buf_)); }
+        if (ImGui::Button("Edit")) {
+            OpenEditDialog(std::string(question_buf_));
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Clear")) { question_buf_[0] = '\0'; }
+        if (ImGui::Button("Clear")) {
+            question_buf_[0] = '\0';
+        }
 
-        // Voice controls (STT)
+        // Voice controls (no inner ASR reads here — we did it at the top)
         {
             bool have_photo = !last_captured_image_.empty();
             if (!have_photo) ImGui::BeginDisabled();
             if (ImGui::Button("🎤 Ask by voice (listen)")) {
-                // Fill the text box from mic; you click "Ask (text)" to send
                 StartListening();
             }
             ImGui::SameLine();
@@ -1564,27 +1704,12 @@ void CameraMixedRealityApp::UpdateGui() {
                 StopListening();
             }
             if (!have_photo) ImGui::EndDisabled();
-
-            // Pull latest ASR into the text box
-            {
-                std::lock_guard<std::mutex> lk(g_asrMutex);
-                if (!g_lastASRError.empty()) {
-                    ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "ASR error: %s", g_lastASRError.c_str());
-                    g_lastASRError.clear();
-                }
-                if (!g_lastASR.empty()) {
-                    std::string transcript = g_lastASR;
-                    g_lastASR.clear();
-                    std::strncpy(question_buf_, transcript.c_str(), sizeof(question_buf_) - 1);
-                    question_buf_[sizeof(question_buf_) - 1] = '\0';
-                }
-            }
         }
 
         ImGui::Separator();
 
         // ───────────────────────────────────────────────────────────
-        // 3) GAZE & CROP OPTIONS (unchanged, but updates world frame live)
+        // 3) GAZE & CROP OPTIONS
         // ───────────────────────────────────────────────────────────
         if (ImGui::CollapsingHeader("Gaze & Crop", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("Use eye gaze to move crop", &crop_with_gaze_);
@@ -1601,8 +1726,11 @@ void CameraMixedRealityApp::UpdateGui() {
 
             bool changed = false;
             changed |= ImGui::SliderFloat("HUD distance (m)", &aim_pad_distance_m_, 0.35f, 0.90f, "%.2f");
-            changed |= ImGui::SliderFloat2("HUD size (m)", &aim_pad_size_m_.x, 0.10f, 0.40f, "%.2f");
-            if (changed) UpdateWorldCropFrame();
+            changed |= ImGui::SliderFloat2("HUD size (m)", &aim_pad_size_m_.x, 0.10f, 1.20f, "%.2f");
+
+            if (changed) {
+                UpdateWorldCropFrame();
+            }
         }
 
         ImGui::Separator();
@@ -1616,74 +1744,17 @@ void CameraMixedRealityApp::UpdateGui() {
             EnsureVLMLoaded();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Unload VLM")) { UnloadVLM(); }
+        if (ImGui::Button("Unload VLM")) {
+            UnloadVLM();
+        }
 
         ImGui::Separator();
 
         // ───────────────────────────────────────────────────────────
-        // 5) LAST PHOTO + PREVIEW + CROP
+        // 5) LAST PHOTO
         // ───────────────────────────────────────────────────────────
         ImGui::Text("Last photo:");
         ImGui::TextWrapped("%s", last_captured_image_.empty() ? "(none yet)" : last_captured_image_.c_str());
-
-#ifdef ML_LUMIN
-        if (!last_captured_image_.empty()) {
-            if (last_photo_loaded_path_ != last_captured_image_) {
-                LoadTextureFromFileRGBA8888(last_captured_image_, last_photo_tex_, last_photo_w_, last_photo_h_);
-                last_photo_loaded_path_ = last_captured_image_;
-            }
-
-            if (last_photo_tex_) {
-                const float maxW = 120.0f;
-                const float aspect = (last_photo_h_ > 0) ? (float)last_photo_w_ / (float)last_photo_h_ : 1.0f;
-                ImVec2 imgSize = (aspect >= 1.0f) ? ImVec2(maxW, maxW / aspect) : ImVec2(maxW * aspect, maxW);
-
-                ImVec2 p0 = ImGui::GetCursorScreenPos();
-                ImGui::Image((ImTextureID)(intptr_t)last_photo_tex_, imgSize);
-
-                // Draw the red crop box (synced with world frame)
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                ImVec2 half = ImVec2(0.5f * crop_norm_size_.x * imgSize.x,
-                                     0.5f * crop_norm_size_.y * imgSize.y);
-                ImVec2 ctr  = ImVec2(p0.x + crop_norm_center_.x * imgSize.x,
-                                     p0.y + crop_norm_center_.y * imgSize.y);
-                ImVec2 r0 = ImVec2(ctr.x - half.x, ctr.y - half.y);
-                ImVec2 r1 = ImVec2(ctr.x + half.x, ctr.y + half.y);
-                dl->AddRect(r0, r1, IM_COL32(255,64,64,255), 0.0f, 0, 2.0f);
-
-                ImGui::TextDisabled("Move with gaze; resize with controller: Bumper=width, Trigger=height, both=scale.");
-                if (ImGui::Button("Crop selection now")) {
-                    const int W = last_photo_w_, H = last_photo_h_;
-                    if (W>0 && H>0) {
-                        int cx = (int)std::roundf(crop_norm_center_.x * W);
-                        int cy = (int)std::roundf(crop_norm_center_.y * H);
-                        int hw = (int)std::roundf(0.5f * crop_norm_size_.x * W);
-                        int hh = (int)std::roundf(0.5f * crop_norm_size_.y * H);
-                        int x0 = std::max(0, cx - hw), x1 = std::min(W, cx + hw);
-                        int y0 = std::max(0, cy - hh), y1 = std::min(H, cy + hh);
-                        int cw = x1 - x0, ch = y1 - y0;
-                        if (cw>8 && ch>8) {
-                            int iw=0, ih=0, ic=0;
-                            unsigned char* img = stbi_load(last_captured_image_.c_str(), &iw, &ih, &ic, 3);
-                            if (img) {
-                                std::vector<unsigned char> crop((size_t)cw*ch*3);
-                                for (int y=0; y<ch; ++y) {
-                                    memcpy(&crop[(size_t)y*cw*3],
-                                           &img[((y0+y)*iw + x0)*3],
-                                           (size_t)cw*3);
-                                }
-                                stbi_image_free(img);
-                                std::string crop_path = default_output_filepath_ + "dk_crop.jpg";
-                                stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
-                                PersistLastImageAlias(crop_path);
-                                last_photo_loaded_path_.clear(); // force texture reload
-                            }
-                        }
-                    }
-                }
-            }
-        }
-#endif
 
         ImGui::Separator();
 
@@ -1695,14 +1766,14 @@ void CameraMixedRealityApp::UpdateGui() {
         ImGui::TextWrapped("%s", onnx_status_message_.c_str());
         ImGui::EndChild();
 
-        // TTS controls
         ImGui::Checkbox("Auto speak answers", &speak_auto_);
         ImGui::SameLine();
         if (ImGui::Button("▶ Speak last answer")) {
-            if (!last_answer_text_.empty() && last_answer_text_ != "(empty)" &&
-                !IsBasicallySame(last_answer_text_, last_question_text_)) {
-                StopListening();           // ensure mic off
-                Speak(last_answer_text_);  // Java TTS
+            StopListening();
+            if (!last_answer_text_.empty() && last_answer_text_ != "(empty)") {
+                Speak(last_answer_text_);
+            } else {
+                Speak("There is no answer yet.");
             }
         }
         ImGui::SameLine();
@@ -1711,7 +1782,7 @@ void CameraMixedRealityApp::UpdateGui() {
             Speak("Text to speech is working.");
         }
 
-        // Auto-speak once per new answer
+        // Auto speak once per new answer (avoid echoing the question)
         static uint64_t last_spoken_seq = 0;
         const uint64_t seq = answer_seq_.load(std::memory_order_relaxed);
         if (speak_auto_ && seq != 0 && seq != last_spoken_seq) {
@@ -1723,9 +1794,10 @@ void CameraMixedRealityApp::UpdateGui() {
                 last_spoken_seq = seq;
             }
         }
-
-        gui.EndDialog();
     }
+
+    // ALWAYS end the dialog, even if opened == false
+    gui.EndDialog();
 
     gui.EndUpdate();
     if (!running) FinishActivity();
@@ -1733,12 +1805,16 @@ void CameraMixedRealityApp::UpdateGui() {
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
 }
-// =========================== end of UpdateGui ===========================
+
+
+
+// ========================= end of UpdateGui ===========================
 
 
 //===========================endof update gui===========================================
 
 // ===== Camera callbacks & helpers =====
+//....................................start of onimageavailble.............................
 void CameraMixedRealityApp::OnImageAvailable(const MLCameraOutput *output,
                                              const MLHandle /*metadata_handle*/,
                                              const MLCameraResultExtras *extra,
@@ -1751,68 +1827,109 @@ void CameraMixedRealityApp::OnImageAvailable(const MLCameraOutput *output,
             this_app->default_output_filename_photo_ + std::to_string(extra->vcam_timestamp) + k_file_ext;
     const std::string output_filename = this_app->default_output_filepath_ + this_app->current_filename_photo_;
 
-    ALOGI("Image output filename: %s", output_filename.c_str());
-    FILE* f = fopen(output_filename.c_str(), "wb");
-    if (f) {
+    // Write full frame to disk
+    {
+        FILE* f = fopen(output_filename.c_str(), "wb");
+        if (!f) { ALOGE("open %s failed: %s", output_filename.c_str(), strerror(errno)); return; }
         fwrite(output->planes[0].data, output->planes[0].size, 1, f);
         fflush(f);
         int fd = fileno(f);
         if (fd >= 0) fsync(fd);
         fclose(f);
+    }
 
-        // Publish via stable alias so the app always has a valid path
-        this_app->PersistLastImageAlias(output_filename);
+    // We will alias exactly once at the end. Default to the raw image.
+    std::string best_alias_path = output_filename;
+    bool did_crop = false;
+
+    // === 1) WORLD-RECT CROP ===
+    {
+        int w=0,h=0,c=0;
+        unsigned char* img = stbi_load(output_filename.c_str(), &w, &h, &c, 3);
+        this_app->latest_image_aspect_ = (h > 0) ? (float)w/(float)h : 1.0f;
+
+        if (img && w>0 && h>0) {
+            // use the rect we had at shutter time (what you saw on HUD)
+            ImVec2 ctr  = this_app->crop_at_shutter_.locked ? this_app->crop_at_shutter_.ctr  : this_app->crop_norm_center_;
+            ImVec2 size = this_app->crop_at_shutter_.locked ? this_app->crop_at_shutter_.size : this_app->crop_norm_size_;
+            this_app->crop_at_shutter_.locked = false;
+
+            const int cx = (int)std::roundf(ctr.x  * w);
+            const int cy = (int)std::roundf(ctr.y  * h);
+            const int hw = (int)std::roundf(0.5f * size.x * w);
+            const int hh = (int)std::roundf(0.5f * size.y * h);
+
+            const int x0 = std::max(0, cx - hw), x1 = std::min(w, cx + hw);
+            const int y0 = std::max(0, cy - hh), y1 = std::min(h, cy + hh);
+            const int cw = x1 - x0, ch = y1 - y0;
+            // ... copy & write dk_crop.jpg as you already do ...
 
 
-
-        bool did_world_crop = false;
-        {
-            int w=0, h=0, c=0;
-            unsigned char* img = stbi_load(output_filename.c_str(), &w, &h, &c, 3);
-            if (img && w>0 && h>0) {
-                // NOTE: use this_app-> for members (static function!)
-                const int cx = (int)std::roundf(this_app->crop_norm_center_.x * w);
-                const int cy = (int)std::roundf(this_app->crop_norm_center_.y * h);
-                const int hw = (int)std::roundf(0.5f * this_app->crop_norm_size_.x * w);
-                const int hh = (int)std::roundf(0.5f * this_app->crop_norm_size_.y * h);
-
-                const int x0 = std::max(0, cx - hw), x1 = std::min(w, cx + hw);
-                const int y0 = std::max(0, cy - hh), y1 = std::min(h, cy + hh);
-                const int cw = x1 - x0, ch = y1 - y0;
-
-                if (cw > 8 && ch > 8) {
-                    std::vector<unsigned char> crop((size_t)cw*ch*3);
-                    for (int y=0; y<ch; ++y)
-                        memcpy(&crop[(size_t)y*cw*3], &img[((y0+y)*w + x0)*3], (size_t)cw*3);
-
-                    const std::string crop_path = this_app->default_output_filepath_ + "dk_crop.jpg";
-                    stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
-
-                    this_app->PersistLastImageAlias(crop_path);
-                    did_world_crop = true;
+            if (cw > 8 && ch > 8) {
+                std::vector<unsigned char> crop((size_t)cw*ch*3);
+                for (int y=0; y<ch; ++y) {
+                    memcpy(&crop[(size_t)y*cw*3], &img[((y0+y)*w + x0)*3], (size_t)cw*3);
                 }
-                stbi_image_free(img);
+                const std::string crop_path = this_app->default_output_filepath_ + "dk_crop.jpg";
+                stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
+                best_alias_path = crop_path;       // <-- set alias target here
+                did_crop = true;
             }
+            stbi_image_free(img);
         }
+    }
 
+    // === 2) GAZE-RETICLE CROP (if world-rect didn't happen) ===
+    if (!did_crop && this_app->have_last_pad_uv_) {
+        this_app->have_last_pad_uv_ = false;
+        int w=0,h=0,c=0;
+        unsigned char* img = stbi_load(output_filename.c_str(), &w, &h, &c, 3);
+        if (img && w>0 && h>0) {
+            const float margin = 0.45f;
+            int cx = (int)std::roundf(w * (0.5f + margin * this_app->last_pad_uv_.x));
+            int cy = (int)std::roundf(h * (0.5f - margin * this_app->last_pad_uv_.y));
+            const int crop_sz = this_app->gaze_crop_px_;
+            const int half    = crop_sz / 2;
+            const int x0 = std::max(0, cx - half);
+            const int y0 = std::max(0, cy - half);
+            const int x1 = std::min(w, x0 + crop_sz);
+            const int y1 = std::min(h, y0 + crop_sz);
+            const int cw = x1 - x0, ch = y1 - y0;
 
+            if (cw > 0 && ch > 0) {
+                std::vector<unsigned char> crop((size_t)cw*ch*3);
+                for (int y = 0; y < ch; ++y) {
+                    memcpy(&crop[(size_t)y*cw*3], &img[((y0+y)*w + x0)*3], (size_t)cw*3);
+                }
+                const std::string crop_path = this_app->default_output_filepath_ + "dk_crop.jpg";
+                stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
+                best_alias_path = crop_path;       // <-- set alias target here
+                did_crop = true;
+            }
+            stbi_image_free(img);
+        }
+    }
 
+    // === 3) CLICK-LOCAL CROP (if neither of the above) ===
+    if (!did_crop && this_app->have_last_click_local_) {
+        this_app->have_last_click_local_ = false;
+        int iw=0, ih=0, ic=0;
+        unsigned char* tmp = stbi_load(output_filename.c_str(), &iw, &ih, &ic, 3);
+        if (tmp) { stbi_image_free(tmp);
+            glm::vec3 s = this_app->capture_button_node_->GetLocalScale();
+            glm::vec2 half_btn = glm::vec2(fabsf(s.x) * 0.5f, fabsf(s.y) * 0.5f);
+            const float nu = (half_btn.x > 1e-6f) ? (this_app->last_click_local_.x / half_btn.x) : 0.0f;
+            const float nv = (half_btn.y > 1e-6f) ? (this_app->last_click_local_.y / half_btn.y) : 0.0f;
 
-// === Gaze-reticle crop (preferred over click-local) ===
-        // === Gaze-reticle crop (preferred over click-local) ===
-        if (this_app->have_last_pad_uv_) {
-            this_app->have_last_pad_uv_ = false; // one-shot
+            const float off_scale_u = 0.15f, off_scale_v = 0.15f;
+            int cx = (int)std::roundf(iw * (0.5f + 0.5f * nu * off_scale_u));
+            int cy = (int)std::roundf(ih * (0.5f - 0.5f * nv * off_scale_v));
 
+            const int crop_sz = this_app->gaze_crop_px_;
             int w=0, h=0, c=0;
             unsigned char* img = stbi_load(output_filename.c_str(), &w, &h, &c, 3);
             if (img) {
-                // Map UV in [-1..+1] to pixels; keep margin to stay in-bounds
-                const float margin = 0.45f; // 0..0.5 (bigger = allow farther from center)
-                int cx = (int)std::roundf(w * (0.5f + margin * this_app->last_pad_uv_.x));
-                int cy = (int)std::roundf(h * (0.5f - margin * this_app->last_pad_uv_.y)); // image Y is top->down
-
-                const int crop_sz = this_app->gaze_crop_px_;
-                const int half    = crop_sz / 2;
+                int half = crop_sz/2;
                 int x0 = std::max(0, cx - half);
                 int y0 = std::max(0, cy - half);
                 int x1 = std::min(w, x0 + crop_sz);
@@ -1822,110 +1939,46 @@ void CameraMixedRealityApp::OnImageAvailable(const MLCameraOutput *output,
                 if (cw > 0 && ch > 0) {
                     std::vector<unsigned char> crop((size_t)cw * ch * 3);
                     for (int y = 0; y < ch; ++y) {
-                        memcpy(&crop[(size_t)y*cw*3],
-                               &img[((y0+y)*w + x0)*3],
-                               (size_t)cw*3);
+                        memcpy(&crop[(size_t)y * cw * 3], &img[((y0 + y) * w + x0) * 3], (size_t)cw * 3);
                     }
                     const std::string crop_path = this_app->default_output_filepath_ + "dk_crop.jpg";
                     stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
-                    this_app->PersistLastImageAlias(crop_path); // point alias to cropped region
-                    ALOGI("gazeCrop: wrote crop at (%d,%d) with UV(%.2f,%.2f)",
-                          cx, cy, this_app->last_pad_uv_.x, this_app->last_pad_uv_.y);
+                    best_alias_path = crop_path;   // <-- set alias target here
+                    did_crop = true;
                 }
                 stbi_image_free(img);
             }
         }
-
-// (your existing "=== Crop around last click if available ===" block stays below this)
-
-
-        // === Crop around last click if available ===
-        // === Crop around last click if available ===
-        if (this_app->have_last_click_local_) {
-            this_app->have_last_click_local_ = false; // one-shot
-
-            int iw=0, ih=0, ic=0;
-            unsigned char* tmp = stbi_load(output_filename.c_str(), &iw, &ih, &ic, 3);
-            if (tmp) {
-                stbi_image_free(tmp);
-
-                // Normalize the stored local coords by current button half extents
-                glm::vec3 s = this_app->capture_button_node_->GetLocalScale();
-                glm::vec2 half_btn = glm::vec2(fabsf(s.x) * 0.5f, fabsf(s.y) * 0.5f);
-                float nu = (half_btn.x > 1e-6f) ? (this_app->last_click_local_.x / half_btn.x) : 0.0f; // [-1..+1]
-                float nv = (half_btn.y > 1e-6f) ? (this_app->last_click_local_.y / half_btn.y) : 0.0f; // [-1..+1]
-
-                // Small bias from center so different click spots nudge the crop a bit
-                const float off_scale_u = 0.15f;
-                const float off_scale_v = 0.15f;
-
-                int cx = (int)std::roundf(iw * (0.5f + 0.5f * nu * off_scale_u));
-                int cy = (int)std::roundf(ih * (0.5f - 0.5f * nv * off_scale_v)); // y top->down
-
-                int crop_sz = this_app->gaze_crop_px_;
-                const std::string crop_path = this_app->default_output_filepath_ + "dk_crop.jpg";
-
-                // Load full image to copy pixels and write JPEG
-                int w=0, h=0, c=0;
-                unsigned char* img = stbi_load(output_filename.c_str(), &w, &h, &c, 3);
-                if (img) {
-                    int half = crop_sz/2;
-                    int x0 = std::max(0, cx - half);
-                    int y0 = std::max(0, cy - half);
-                    int x1 = std::min(w, x0 + crop_sz);
-                    int y1 = std::min(h, y0 + crop_sz);
-                    int cw = x1 - x0, ch = y1 - y0;
-
-                    if (cw > 0 && ch > 0) {
-                        std::vector<unsigned char> crop((size_t)cw * ch * 3);
-                        for (int y = 0; y < ch; ++y) {
-                            memcpy(&crop[(size_t)y * cw * 3],
-                                   &img[((y0 + y) * w + x0) * 3],
-                                   (size_t)cw * 3);
-                        }
-
-                        // stbi_write_jpg is provided by your single, top-of-file inclusion of stb_image_write.h
-                        stbi_write_jpg(crop_path.c_str(), cw, ch, 3, crop.data(), 90);
-
-                        // Point the stable alias (dk.jpg) to the crop
-                        this_app->PersistLastImageAlias(crop_path);
-                        ALOGI("clickXR: wrote cropped image: %s", crop_path.c_str());
-                    }
-                    stbi_image_free(img);
-                }
-            }
-        }
-
-
-
-
-
-
-
-
-
-        if (this_app->pending_voice_question_) {
-            // user chose "Capture & ask by voice"
-            this_app->pending_voice_question_ = false;
-            this_app->StartListening();
-        } else if (this_app->send_to_vlm_after_capture_) {
-            // user chose "Capture & Ask in text"
-            this_app->send_to_vlm_after_capture_ = false; // one-shot
-            std::string q = this_app->typed_question_;
-            if (q.empty()) q = this_app->question_buf_;   // fallback to what's in the box
-            if (q.empty()) q = "What is in the image?";
-            // IMPORTANT: use the stable alias we just wrote
-            this_app->InitializeONNX(this_app->last_captured_image_, q);
-            this_app->typed_question_.clear();
-        }
-
-    } else {
-        ALOGE("Failed to open %s, with error: %s!", output_filename.c_str(), strerror(errno));
     }
 
+    // Alias exactly once (cropped if we made one, else raw)
+    this_app->PersistLastImageAlias(best_alias_path);
+
+    // Continue with your post-capture flow …
+    if (this_app->pending_voice_question_) {
+        this_app->pending_voice_question_ = false;
+        this_app->awaiting_auto_question_ = true;   // NEW
+        this_app->awaiting_timer_s_       = 0.0f;   // NEW
+        this_app->since_last_asr_s_       = 0.0f;   // NEW
+
+
+        this_app->heard_any_asr_          = false;   // NEW
+
+
+        this_app->StartListening();
+    } else if (this_app->send_to_vlm_after_capture_) {
+        this_app->send_to_vlm_after_capture_ = false;
+        std::string q = this_app->typed_question_;
+        if (q.empty()) q = this_app->question_buf_;
+        if (q.empty()) q = "What is in the image?";
+        this_app->InitializeONNX(this_app->last_captured_image_, q);
+        this_app->typed_question_.clear();
+    }
 }
 
- //............................................................
+
+//...................................end of onimageavailble ................
+//............................................................
 
 MLResult CameraMixedRealityApp::CaptureImage() {
     MLHandle metadata_handle = ML_INVALID_HANDLE;
@@ -2091,6 +2144,11 @@ MLResult CameraMixedRealityApp::SetupCaptureSize() {
         capture_width_ = width;
         capture_height_ = height;
     }
+
+
+    latest_image_aspect_ = (capture_height_ > 0) ?
+                           (float)capture_width_ / (float)capture_height_ : 1.0f;
+
     return MLResult_Ok;
 }
 
@@ -2866,8 +2924,17 @@ void CameraMixedRealityApp::DestroyVoice() {
 }
 
 void CameraMixedRealityApp::StartListening() {
+    std::lock_guard<std::mutex> lk(g_asrMutex);
+    g_lastASR.clear();
+    g_lastASRError.clear();
+
+
     if (listening_) return;
-    if (!app_state_ || !app_state_->activity || !g_VoiceBridgeObj || !g_VoiceBridgeCls) return;
+
+    if (!app_state_ || !app_state_->activity || !g_VoiceBridgeObj || !g_VoiceBridgeCls) {
+        onnx_status_message_ = "Voice bridge not initialized.";
+        return;
+    }
     JNIEnv* env = nullptr; app_state_->activity->vm->AttachCurrentThread(&env, nullptr);
     if (!env) return;
     jmethodID m = env->GetMethodID(g_VoiceBridgeCls, "startListening", "()V");
